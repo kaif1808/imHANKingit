@@ -57,10 +57,16 @@ ALPHA_SMOOTH   = 0.1         # Dirichlet smoothing parameter
 MIN_WEIGHTED_N = 30          # flag bins below this
 RANDOM_SEED    = 42
 
-PNADC_PANEL_FILES = ["pnadc_panel_5.csv", "pnadc_panel_6.csv", "pnadc_panel_7.csv"]
+PNADC_DATA_DIR = BASE_DIR / "PNAD-C-Treated"
+PNADC_CSV_FILES = ["test5.csv", "test6.csv", "test7.csv"]
 
 parser = argparse.ArgumentParser(description="HTM Agent Classification Pipeline")
 parser.add_argument("--no-choropleth", action="store_true", help="Skip choropleth map generation")
+parser.add_argument(
+    "--per-quarter-quintiles",
+    action="store_true",
+    help="Use per-quarter quintiles instead of POF cut-points (reduces seasonal bias)",
+)
 args = parser.parse_args()
 
 # ============================================================================
@@ -455,10 +461,11 @@ pof["education_group"] = pof_education_group(pof["NIVEL_INSTRUCAO"])
 # Labour status
 pof["labor_status"] = pof.apply(pof_labor_status, axis=1)
 
-# Per-capita income quintile (weighted)
-pof["pc_income_quintile"] = pd.qcut(
-    pof["pc_income"], q=5, labels=["Q1", "Q2", "Q3", "Q4", "Q5"]
-).astype(str)
+# Per-capita income quintile (weighted); save cut-points for PNADC alignment
+pof["pc_income_quintile"], pof_quintile_edges = pd.qcut(
+    pof["pc_income"], q=5, labels=["Q1", "Q2", "Q3", "Q4", "Q5"], retbins=True
+)
+pof["pc_income_quintile"] = pof["pc_income_quintile"].astype(str)
 
 # Composite bin key
 pof["bin_key"] = (
@@ -513,8 +520,8 @@ print("STEP 3: LOAD PNADC & MERGE TYPE SHARES")
 print("=" * 72)
 
 frames = []
-for fname in PNADC_PANEL_FILES:
-    csv_path = BASE_DIR / fname
+for fname in PNADC_CSV_FILES:
+    csv_path = PNADC_DATA_DIR / fname
     if not csv_path.exists():
         print(f"  ⚠  {fname} not found – skipping")
         continue
@@ -527,18 +534,26 @@ for fname in PNADC_PANEL_FILES:
 pnadc = pd.concat(frames, ignore_index=True)
 print(f"  Total PNADC records: {len(pnadc):,}")
 
-# Key columns
-pnadc["uf_code"]  = pd.to_numeric(pnadc["UF"], errors="coerce")
-pnadc["age"]      = pd.to_numeric(pnadc["V2009"], errors="coerce")
-pnadc["sex_code"] = pd.to_numeric(pnadc["V2007"], errors="coerce")
-pnadc["vd3004"]   = pd.to_numeric(pnadc["VD3004"], errors="coerce")
-pnadc["weight"]   = pd.to_numeric(pnadc["V1028"], errors="coerce")
+# Detect datazoom test format (faixa_idade, no V2009) vs raw panel (V2009, VD3004)
+use_test_format = "faixa_idade" in pnadc.columns and "V2009" not in pnadc.columns
 
-# Habitual income for quintile
-pnadc["rendimento"] = pd.to_numeric(pnadc.get("rendimento_habitual_real", np.nan),
-                                     errors="coerce").fillna(0)
-# Household size proxy (V2001)
-pnadc["hh_size"] = pd.to_numeric(pnadc["V2001"], errors="coerce").clip(lower=1)
+# Key columns
+pnadc["uf_code"] = pd.to_numeric(pnadc["UF"], errors="coerce")
+if use_test_format:
+    pnadc["age"] = faixa_idade_to_age(pnadc["faixa_idade"])
+    pnadc["sex_code"] = pnadc["sexo"].map({"Homem": 1, "Mulher": 2})
+    pnadc["vd3004"] = faixa_educ_to_vd3004(pnadc["faixa_educ"])
+    pnadc["weight"] = pd.to_numeric(pnadc["Habitual"], errors="coerce")
+    pnadc["rendimento"] = pd.to_numeric(pnadc["rendimento_habitual_real"], errors="coerce").fillna(0)
+    pnadc["hh_size"] = pnadc.groupby(["Ano", "Trimestre", "ID_DOMICILIO"])["Ano"].transform("count")
+    pnadc["hh_size"] = pnadc["hh_size"].clip(lower=1)
+else:
+    pnadc["age"] = pd.to_numeric(pnadc["V2009"], errors="coerce")
+    pnadc["sex_code"] = pd.to_numeric(pnadc["V2007"], errors="coerce")
+    pnadc["vd3004"] = pd.to_numeric(pnadc["VD3004"], errors="coerce")
+    pnadc["weight"] = pd.to_numeric(pnadc["V1028"], errors="coerce")
+    pnadc["rendimento"] = pd.to_numeric(pnadc.get("rendimento_habitual_real", np.nan), errors="coerce").fillna(0)
+    pnadc["hh_size"] = pd.to_numeric(pnadc["V2001"], errors="coerce").clip(lower=1)
 pnadc["pc_income_pnadc"] = pnadc["rendimento"] / pnadc["hh_size"]
 
 # Keep age ≥ 15
@@ -559,11 +574,32 @@ for col in ["formal", "informal", "ocupado", "desocupado",
         pnadc[col] = pd.to_numeric(pnadc[col], errors="coerce").fillna(0)
 pnadc["labor_status"] = pnadc.apply(pnadc_labor_status, axis=1)
 
-# Income quintile (match POF cut-points)
-pnadc["pc_income_quintile"] = pd.qcut(
-    pnadc["pc_income_pnadc"].rank(method="first"),
-    q=5, labels=["Q1", "Q2", "Q3", "Q4", "Q5"]
-).astype(str)
+# Income quintile: POF cut-points (default) or per-quarter quintiles
+if args.per_quarter_quintiles:
+    pnadc["pc_income_quintile"] = (
+        pnadc.groupby(["year", "quarter"])["pc_income_pnadc"]
+        .transform(
+            lambda x: pd.qcut(
+                x.rank(method="first"),
+                q=5,
+                labels=["Q1", "Q2", "Q3", "Q4", "Q5"],
+            )
+        )
+        .astype(str)
+        .fillna("Q3")
+    )
+else:
+    bins_extended = np.concatenate([[-np.inf], pof_quintile_edges[1:-1], [np.inf]])
+    pnadc["pc_income_quintile"] = (
+        pd.cut(
+            pnadc["pc_income_pnadc"],
+            bins=bins_extended,
+            labels=["Q1", "Q2", "Q3", "Q4", "Q5"],
+            include_lowest=True,
+        )
+        .astype(str)
+        .fillna("Q3")  # fallback for NaN income
+    )
 
 # Bin key
 pnadc["bin_key"] = (
@@ -587,7 +623,8 @@ nat_avg_ph2m = pof_national["PH2M"]
 nat_avg_wh2m = pof_national["WH2M"]
 nat_avg_ric  = pof_national["Ricardian"]
 
-n_unmatched = pnadc["p_ph2m"].isna().sum()
+pnadc["_unmatched_bin"] = pnadc["p_ph2m"].isna()
+n_unmatched = pnadc["_unmatched_bin"].sum()
 pnadc["p_ph2m"] = pnadc["p_ph2m"].fillna(nat_avg_ph2m)
 pnadc["p_wh2m"] = pnadc["p_wh2m"].fillna(nat_avg_wh2m)
 pnadc["p_ric"]  = pnadc["p_ric"].fillna(nat_avg_ric)
@@ -609,6 +646,30 @@ print("  ├──────────────┬───────�
 print(f"  │  PH2M        │  WH2M        │  Ricardian   │  N obs    │")
 print(f"  │  {merge_shares['PH2M']:.4f}      │  {merge_shares['WH2M']:.4f}      │  {merge_shares['Ricardian']:.4f}    │  {len(pnadc):>7,} │")
 print("  └──────────────┴──────────────┴──────────────┴───────────┘")
+
+# ── Per-quarter diagnostics (for calibration / 2017Q4 investigation) ───────
+print("\n  Per-quarter diagnostics:")
+
+def _quarter_diag(g):
+    return pd.Series({
+        "n_obs": len(g),
+        "n_unmatched": g["_unmatched_bin"].sum(),
+        "mean_pc_income": round(g["pc_income_pnadc"].mean(), 2),
+        "share_Q1": (g["pc_income_quintile"] == "Q1").mean(),
+        "share_Q2": (g["pc_income_quintile"] == "Q2").mean(),
+        "share_Q3": (g["pc_income_quintile"] == "Q3").mean(),
+        "share_Q4": (g["pc_income_quintile"] == "Q4").mean(),
+        "share_Q5": (g["pc_income_quintile"] == "Q5").mean(),
+        "share_formal": (g["labor_status"] == "formal").mean(),
+        "share_informal": (g["labor_status"] == "informal").mean(),
+        "share_self_employed": (g["labor_status"] == "self_employed").mean(),
+        "share_unemployed": (g["labor_status"] == "unemployed").mean(),
+        "share_inactive": (g["labor_status"] == "inactive").mean(),
+    })
+
+diag = pnadc.groupby(["year", "quarter"]).apply(_quarter_diag)
+print(diag.to_string())
+pnadc = pnadc.drop(columns=["_unmatched_bin"])
 
 
 ###############################################################################

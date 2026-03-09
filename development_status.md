@@ -2,6 +2,20 @@
 
 ## Latest Update — 2026-03-09
 
+### HTM Classification: 2017 Q4 Ricardian calibration fixes
+
+Addressed the ~10pp drop in Ricardian agent share from 2017 Q3 to Q4 by fixing POF–PNADC quintile alignment and adding diagnostics.
+
+**What was done:**
+- **POF–PNADC quintile cut-point mismatch (fix #1):** PNADC now uses POF income quintile cut-points instead of within-PNADC ranks, so bin matching aligns on the same income scale. This largely eliminated the 2017 Q4 discontinuity (e.g. UF 33: 70%→59% became 59%→60%).
+- **Per-quarter quintiles option (fix #2):** Added `--per-quarter-quintiles` flag to use within-quarter quintiles instead of POF cut-points (reduces seasonal bias when enabled).
+- **Per-quarter diagnostics:** Added diagnostic block outputting, by year–quarter: n_obs, n_unmatched bins, mean pc_income, quintile shares (Q1–Q5), labor status shares (formal, informal, self_employed, unemployed, inactive).
+
+**Updated files:**
+- `htm_classification.py` — POF retbins for cut-points; PNADC quintile logic (POF cut-points or per-quarter); `--per-quarter-quintiles` flag; per-quarter diagnostic table
+
+## Prior Update — 2026-03-09
+
 ### HTM Classification: 8-panel CSV input and choropleth generation
 
 Modified `htm_classification.py` to use PNADC panel CSV files and generate per-quarter choropleth maps.
@@ -16,6 +30,25 @@ Modified `htm_classification.py` to use PNADC panel CSV files and generate per-q
 **Updated files:**
 - `htm_classification.py` — CSV load, choropleth step, argparse
 - `requirements.txt` — geopandas already present
+
+### PNADC panel filtering helper (R)
+
+Added a lightweight R helper script to pre-filter large PNADC panel CSVs down to only the columns required by the PNADC pipeline in `htm_classification.py`, writing per-panel `test5/6/7.csv` files into `PNAD-C-Treated` while processing each panel sequentially with explicit garbage collection.
+
+**Updated files:**
+- `pnad.r` — new `process_panel()` helper using `data.table::fread/fwrite` and per-panel `gc()` for memory efficiency
+
+### Per-quarter choropleth generation from CSV
+
+Added standalone script and updated notebook to generate per-quarter choropleth maps from `state_quarter_htm_shares.csv` without running the full pipeline.
+
+**What was done:**
+- Created `generate_choropleths.py` — reads CSV, downloads IBGE shapefile, produces one 4-panel choropleth (PH2M, WH2M, total HtM, Ricardian) per quarter; supports `--input` and `--output-dir`
+- Updated `htm_classification_report.ipynb` Section 6 — replaced single aggregated map with per-quarter loop; saves `choropleth_htm_{year}Q{quarter}.png` for each quarter; displays first quarter as example
+
+**Updated files:**
+- `generate_choropleths.py` — new standalone script
+- `htm_classification_report.ipynb` — cells 12–13: per-quarter generation and display
 
 ## Prior Update — 2026-03-05
 
