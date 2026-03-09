@@ -1,6 +1,23 @@
 # Development Status
 
-## Latest Update — 2026-03-05
+## Latest Update — 2026-03-09
+
+### HTM Classification: 8-panel CSV input and choropleth generation
+
+Modified `htm_classification.py` to use PNADC panel CSV files and generate per-quarter choropleth maps.
+
+**What was done:**
+- Replaced PNADC RDS loading with CSV loading from `pnadc_panel_5.csv`, `pnadc_panel_6.csv`, `pnadc_panel_7.csv`
+- Added Step 6: choropleth map generation per quarter (PH2M, WH2M, total HtM, Ricardian)
+- Downloads IBGE state boundaries from geoftp.ibge.gov.br; graceful fallback if download fails
+- Added `--no-choropleth` flag to skip map generation
+- Output: `state_quarter_htm_shares.csv` (54 rows: 27 states × 2 quarters from current panels), `choropleth_htm_{year}Q{quarter}.png` per quarter
+
+**Updated files:**
+- `htm_classification.py` — CSV load, choropleth step, argparse
+- `requirements.txt` — geopandas already present
+
+## Prior Update — 2026-03-05
 
 ### HTM Classification Report → Jupyter Notebook conversion
 

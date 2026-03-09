@@ -10,7 +10,7 @@ the Kaplan–Violante–Weidner (2014) framework:
 
 Data sources:
   POF  2017-18  – household budget survey  (fixed-width txt)
-  PNADC 2017-18 – quarterly labour force survey  (RDS via pyreadr)
+  PNADC – quarterly labour force survey  (CSV: pnadc_panel_5/6/7.csv)
 
 Steps:
   1. POF: classify each household into an agent type
@@ -18,16 +18,27 @@ Steps:
   3. PNADC: build identical bins & merge type shares
   4. PNADC: Monte Carlo type assignment
   5. PNADC: aggregate to state–quarter shares
+  6. Generate choropleth maps per quarter
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
+import argparse
+import io
+import ssl
+import tempfile
+import zipfile
+from pathlib import Path
+from urllib import request as urllib_request
+
+import geopandas as gpd
+import matplotlib.colors as mcolors
+import matplotlib.patheffects as pe
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyreadr
-import os
-from pathlib import Path
 
 # ============================================================================
 # CONFIGURATION
@@ -46,7 +57,11 @@ ALPHA_SMOOTH   = 0.1         # Dirichlet smoothing parameter
 MIN_WEIGHTED_N = 30          # flag bins below this
 RANDOM_SEED    = 42
 
-PNADC_YEARS    = [2017, 2018]
+PNADC_PANEL_FILES = ["pnadc_panel_5.csv", "pnadc_panel_6.csv", "pnadc_panel_7.csv"]
+
+parser = argparse.ArgumentParser(description="HTM Agent Classification Pipeline")
+parser.add_argument("--no-choropleth", action="store_true", help="Skip choropleth map generation")
+args = parser.parse_args()
 
 # ============================================================================
 # HELPER: read POF fixed-width file using the Excel dictionary
@@ -498,16 +513,15 @@ print("STEP 3: LOAD PNADC & MERGE TYPE SHARES")
 print("=" * 72)
 
 frames = []
-for yr in PNADC_YEARS:
-    rds_path = BASE_DIR / f"pnadc_{yr}_1.rds"
-    if not rds_path.exists():
-        print(f"  ⚠  {rds_path.name} not found – skipping")
+for fname in PNADC_PANEL_FILES:
+    csv_path = BASE_DIR / fname
+    if not csv_path.exists():
+        print(f"  ⚠  {fname} not found – skipping")
         continue
-    print(f"  Loading {rds_path.name} …")
-    result = pyreadr.read_r(str(rds_path))
-    df = list(result.values())[0]
-    df["year"] = yr
-    df["quarter"] = 1
+    print(f"  Loading {fname} …")
+    df = pd.read_csv(csv_path)
+    df["year"] = pd.to_numeric(df["Ano"], errors="coerce")
+    df["quarter"] = pd.to_numeric(df["Trimestre"], errors="coerce")
     frames.append(df)
 
 pnadc = pd.concat(frames, ignore_index=True)
@@ -677,6 +691,131 @@ summary = pd.DataFrame({
 summary["Total"] = summary["PH2M"] + summary["WH2M"] + summary["Ricardian"]
 
 print("\n", summary.to_string(index=False))
+
+
+###############################################################################
+#                     STEP 6 – CHOROPLETH MAPS PER QUARTER
+###############################################################################
+choropleth_generated = False
+if not args.no_choropleth:
+    print("\n" + "=" * 72)
+    print("STEP 6: CHOROPLETH MAPS")
+    print("=" * 72)
+
+    # Download IBGE state boundaries
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    shp_url = (
+        "https://geoftp.ibge.gov.br/organizacao_do_territorio/"
+        "malhas_territoriais/malhas_municipais/municipio_2022/"
+        "Brasil/BR/BR_UF_2022.zip"
+    )
+    shp_dir = Path(tempfile.mkdtemp())
+    brazil = None
+    try:
+        req = urllib_request.Request(shp_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib_request.urlopen(req, timeout=120, context=ctx) as r:
+            with zipfile.ZipFile(io.BytesIO(r.read())) as z:
+                z.extractall(shp_dir)
+        brazil = gpd.read_file(next(shp_dir.glob("*.shp"))).to_crs("EPSG:4326")
+    except Exception as e:
+        print(f"  ⚠  Could not download IBGE shapefile: {e}")
+        print("  Skipping choropleth generation. Run again or use --no-choropleth.")
+    if brazil is not None:
+        brazil["uf_code"] = brazil["CD_UF"].astype(int)
+
+        region_map = {
+            "Norte": ["AM", "PA", "AC", "RO", "RR", "AP", "TO"],
+            "Nordeste": ["MA", "PI", "CE", "RN", "PB", "PE", "AL", "SE", "BA"],
+            "Sudeste": ["MG", "ES", "RJ", "SP"],
+            "Sul": ["PR", "SC", "RS"],
+            "Centro-Oeste": ["MT", "MS", "GO", "DF"],
+        }
+        sigla_to_region = {s: r for r, states in region_map.items() for s in states}
+        brazil["macro_region"] = brazil["SIGLA_UF"].map(sigla_to_region)
+        regions_gdf = brazil.dissolve(by="macro_region").reset_index()
+
+        panels = [
+            ("PH2M", "Poor HtM", "#b2182b", "#fddbc7"),
+            ("WH2M", "Wealthy HtM", "#2166ac", "#d1e5f0"),
+            ("total_HtM", "Total HtM", "#542788", "#f7f7f7"),
+            ("Ricardian", "Ricardian", "#1b7837", "#d9f0d3"),
+        ]
+
+        state_qtr_valid = state_qtr.dropna(subset=["year", "quarter"])
+        for (yr, qtr), grp in state_qtr_valid.groupby(["year", "quarter"]):
+            yr, qtr = int(yr), int(qtr)
+            htm_q = grp.assign(uf_code=lambda d: d["uf_code"].astype(int)).copy()
+            htm_q["PH2M"] = htm_q["share_PH2M"]
+            htm_q["WH2M"] = htm_q["share_WH2M"]
+            htm_q["Ricardian"] = htm_q["share_Ricardian"]
+            htm_q["total_HtM"] = htm_q["PH2M"] + htm_q["WH2M"]
+            gdf = brazil.merge(htm_q[["uf_code", "PH2M", "WH2M", "Ricardian", "total_HtM", "total_weight"]],
+                              on="uf_code", how="left")
+
+            fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+            fig.patch.set_facecolor("#F7F4EF")
+            axes = axes.flatten()
+
+            for ax, (col, title, dark, light) in zip(axes, panels):
+                ax.set_facecolor("#cce5f0")
+                valid = gdf[col].dropna()
+                vmin = valid.quantile(0.05) if len(valid) > 0 else 0
+                vmax = valid.quantile(0.95) if len(valid) > 0 else 1
+                cmap = mcolors.LinearSegmentedColormap.from_list(col, [light, dark], N=256)
+                gdf.plot(column=col, ax=ax, cmap=cmap, vmin=vmin, vmax=vmax,
+                         linewidth=0.35, edgecolor="white",
+                         missing_kwds={"color": "#cccccc"})
+                regions_gdf.plot(ax=ax, facecolor="none", edgecolor="#222222", linewidth=1.6)
+                for _, row in gdf.iterrows():
+                    pt = row.geometry.representative_point()
+                    if pd.notna(row[col]):
+                        ax.annotate(row["SIGLA_UF"], xy=(pt.x, pt.y), ha="center", va="center",
+                                    fontsize=5.2, color="white", fontweight="bold",
+                                    path_effects=[pe.withStroke(linewidth=1.2, foreground="#00000055")])
+                for _, rrow in regions_gdf.iterrows():
+                    rpt = rrow.geometry.centroid
+                    ax.annotate(rrow["macro_region"], xy=(rpt.x, rpt.y), ha="center", va="center",
+                                fontsize=7, color="#111111", fontstyle="italic", fontweight="bold", alpha=0.55)
+                sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
+                sm.set_array([])
+                cbar = fig.colorbar(sm, ax=ax, fraction=0.028, pad=0.02, shrink=0.72)
+                cbar.ax.yaxis.set_tick_params(labelsize=8, color="0.4")
+                cbar.set_label("Share", fontsize=8, color="0.4")
+                cbar.ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
+                valid_gdf = gdf[gdf[col].notna()]
+                if len(valid_gdf) > 0:
+                    lo_row = gdf.loc[gdf[col].idxmin()]
+                    hi_row = gdf.loc[gdf[col].idxmax()]
+                    ax.set_title(f"{title} share\n↑ {hi_row['SIGLA_UF']} {hi_row[col]:.1%}   "
+                                 f"↓ {lo_row['SIGLA_UF']} {lo_row[col]:.1%}",
+                                 fontsize=11, pad=8, color="#111111")
+                else:
+                    ax.set_title(f"{title} share", fontsize=11, pad=8, color="#111111")
+                ax.axis("off")
+
+            wt = gdf["uf_code"].map(grp.set_index("uf_code")["total_weight"]).fillna(1)
+
+            def wnat(c):
+                return np.average(gdf[c].fillna(0), weights=wt)
+
+            fig.suptitle(
+                f"HTM Agent-Type Shares by Brazilian State  (PNADC {yr} Q{qtr})\n"
+                f"Population-weighted national:  PH2M {wnat('PH2M'):.1%}  │  "
+                f"WH2M {wnat('WH2M'):.1%}  │  Total HtM {wnat('total_HtM'):.1%}  │  "
+                f"Ricardian {wnat('Ricardian'):.1%}\n"
+                "Bold borders = macro-region boundaries",
+                fontsize=11, y=1.005, color="#111111", linespacing=1.7)
+            plt.tight_layout(h_pad=3, w_pad=2)
+            out_png = BASE_DIR / f"choropleth_htm_{yr}Q{qtr}.png"
+            fig.savefig(out_png, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  Saved {out_png.name}")
+            choropleth_generated = True
+
 print("\n✅ Pipeline complete. Output files:")
 print(f"   • {out_path_bins}")
 print(f"   • {out_path_sq}")
+if choropleth_generated:
+    print(f"   • choropleth_htm_*.png (per quarter)")
