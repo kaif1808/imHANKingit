@@ -1,6 +1,23 @@
 # Development Status
 
-## Latest Update — 2026-03-09
+## Latest Update — 2026-03-10
+
+### HTM Classification Report: Updated for 8 quarters (2017 Q1 – 2018 Q4)
+
+Restructured `htm_classification_report.ipynb` to align with the current pipeline (panels 5, 6, 7 covering 2017 Q1 – 2018 Q4).
+
+**What was done:**
+- **Data Sources table:** PNADC row updated to 2017 Q1 – 2018 Q4 (8 quarters), CSV format (test5/6/7.csv)
+- **Pipeline Architecture:** Added Step 6 (choropleth maps per quarter)
+- **Shared config cell:** Added PNADC_CSV_FILES and PNADC_DATA_DIR aligned with htm_classification.py
+- **Output table:** Dynamic quarter/row counts (27 states × N quarters)
+- **Match rate footnotes:** "Illustrative; actual values depend on PNADC panels loaded"
+- **Choropleth caption:** Clarified one map generated per quarter
+
+**Updated files:**
+- `htm_classification_report.ipynb` — Data Sources, pipeline step 6, config, output table, footnotes, figure caption
+
+## Prior Update — 2026-03-09
 
 ### HTM Classification: 2017 Q4 Ricardian calibration fixes
 
