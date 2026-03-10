@@ -16,7 +16,9 @@ vars_needed <- c(
   "ID_DOMICILIO", "V2001",
   # Labour status flags (if present)
   "formal", "informal", "ocupado", "desocupado",
-  "conta_propria", "fora_forca_trab"
+  "conta_propria", "fora_forca_trab",
+  # ID Numbers
+  "id_dom", "id_ind", "id_rs", "num_appearances"
 )
 
 process_panel <- function(panel_id) {
