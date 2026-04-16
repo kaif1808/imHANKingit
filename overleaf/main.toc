@@ -1,0 +1,7 @@
+\beamer@sectionintoc {1}{Data \& Pipeline}{3}{0}{1}
+\beamer@sectionintoc {2}{Classification Methodology}{6}{0}{2}
+\beamer@sectionintoc {3}{Bin Matching}{10}{0}{3}
+\beamer@sectionintoc {4}{Validation}{14}{0}{4}
+\beamer@sectionintoc {5}{Regional Results}{15}{0}{5}
+\beamer@sectionintoc {6}{Robustness}{24}{0}{6}
+\beamer@sectionintoc {7}{Outputs}{25}{0}{7}

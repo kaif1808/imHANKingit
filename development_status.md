@@ -2,6 +2,26 @@
 
 ## Latest Update — 2026-03-10
 
+### Overleaf main.tex: Expanded with full report content
+
+Expanded `overleaf/main.tex` with all relevant information from `htm_classification_report.ipynb`.
+
+**What was done:**
+- **Introduction:** Added literature refs (Carvalho & Zilberman 2022; De Souza 2023); clarified POF→PNADC transfer
+- **Data Sources:** Added Key variables column
+- **New frame: POF Table Structure** — 5 files and key columns
+- **Classification:** QUADRO 56 detail for Bolsa Família; expanded parameter descriptions
+- **Bin Matching:** Notes column on Six Bin Dimensions; new Mismatch Problem frame (60.2% match, root causes); Before/After table; Strategy Comparison table (A, D, G, I)
+- **Validation:** Monte Carlo note; Warning block on WH2M elevation
+- **Regional Results:** New Key Regional Patterns frame (PH2M/WH2M/Ricardian by region)
+- **Robustness:** λ sweep 0.25–1.50; sensitivity findings
+- **Outputs:** Dirichlet smoothing, 4-panel choropleth description
+
+**Updated files:**
+- `overleaf/main.tex` — 25 frames, 313 lines (was 237)
+
+## Prior Update — 2026-03-10
+
 ### HTM Classification Report: Updated for 8 quarters (2017 Q1 – 2018 Q4)
 
 Restructured `htm_classification_report.ipynb` to align with the current pipeline (panels 5, 6, 7 covering 2017 Q1 – 2018 Q4).
