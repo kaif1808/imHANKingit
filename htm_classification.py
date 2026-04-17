@@ -46,6 +46,9 @@ import pyreadr
 BASE_DIR   = Path("/Users/kai/Desktop/imHANKingit")
 DATA_DIR   = BASE_DIR / "Data" / "Dados_20230713"
 DICT_FILE  = BASE_DIR / "Data" / "Documentacao_20230713" / "Dicionarios de variaveis.xls"
+RESULTS_DIR = BASE_DIR / "results"
+TABLES_DIR = RESULTS_DIR / "tables"
+PLOTS_DIR = RESULTS_DIR / "plots"
 
 SELIC_RATE     = 0.09        # SELIC ≈ 9% for 2017-18
 LIQUID_THRESH  = 0.50        # liquid_assets / monthly_income threshold
@@ -505,7 +508,10 @@ def compute_bin_shares(group):
 bin_shares = pof.groupby("bin_key", as_index=False).apply(compute_bin_shares)
 
 # Save
-out_path_bins = BASE_DIR / "pof_bin_shares.csv"
+TABLES_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+out_path_bins = TABLES_DIR / "pof_bin_shares.csv"
 bin_shares.to_csv(out_path_bins, index=False)
 print(f"\n  Saved {len(bin_shares):,} bins → {out_path_bins}")
 print(f"  Bins with < {MIN_WEIGHTED_N} weighted obs (flagged): "
@@ -729,7 +735,7 @@ out_cols = ["uf_code", "year", "quarter",
             "share_PH2M", "share_WH2M", "share_Ricardian", "total_weight"]
 state_qtr = state_qtr[out_cols].sort_values(["year", "quarter", "uf_code"])
 
-out_path_sq = BASE_DIR / "state_quarter_htm_shares.csv"
+out_path_sq = TABLES_DIR / "state_quarter_htm_shares.csv"
 state_qtr.to_csv(out_path_sq, index=False)
 print(f"\n  Saved {len(state_qtr)} state-quarter rows → {out_path_sq}")
 print(f"\n  Preview:")
@@ -869,7 +875,7 @@ if not args.no_choropleth:
                 "Bold borders = macro-region boundaries",
                 fontsize=11, y=1.005, color="#111111", linespacing=1.7)
             plt.tight_layout(h_pad=3, w_pad=2)
-            out_png = BASE_DIR / f"choropleth_htm_{yr}Q{qtr}.png"
+            out_png = PLOTS_DIR / f"choropleth_htm_{yr}Q{qtr}.png"
             fig.savefig(out_png, dpi=150, bbox_inches="tight")
             plt.close(fig)
             print(f"  Saved {out_png.name}")

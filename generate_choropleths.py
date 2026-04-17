@@ -22,6 +22,9 @@ import numpy as np
 import pandas as pd
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+RESULTS_DIR = SCRIPT_DIR / "results"
+TABLES_DIR = RESULTS_DIR / "tables"
+PLOTS_DIR = RESULTS_DIR / "plots"
 SHP_URL = (
     "https://geoftp.ibge.gov.br/organizacao_do_territorio/"
     "malhas_territoriais/malhas_municipais/municipio_2022/"
@@ -174,13 +177,13 @@ def main():
     parser.add_argument(
         "--input",
         type=Path,
-        default=SCRIPT_DIR / "state_quarter_htm_shares.csv",
+        default=TABLES_DIR / "state_quarter_htm_shares.csv",
         help="Path to state_quarter_htm_shares.csv",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=SCRIPT_DIR,
+        default=PLOTS_DIR,
         help="Directory for output PNG files",
     )
     args = parser.parse_args()

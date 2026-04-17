@@ -1,0 +1,219 @@
+---
+title: "IRF diagnostics: pooled and state-level"
+format:
+  pdf:
+    toc: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Setup
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(lmtest)
+library(sandwich)
+```
+
+## Data prep
+
+```{r}
+base <- read.csv("aggregate_state_monthly_shock_h2m.csv") |>
+  mutate(
+    uf_code = as.integer(uf_code),
+    year = as.integer(year),
+    month_num = as.integer(month_num),
+    date = as.integer(date)
+  )
+
+# output locations
+results_dir <- "results"
+csv_dir <- file.path(results_dir, "tables")
+png_dir <- file.path(results_dir, "plots")
+state_png_dir <- file.path(png_dir, "state_irf")
+dir.create(csv_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(state_png_dir, recursive = TRUE, showWarnings = FALSE)
+
+uf_lookup <- tibble(
+  uf_code = c(11,12,13,14,15,16,17,21,22,23,24,25,26,27,28,29,31,32,33,35,41,42,43,50,51,52,53),
+  state_name_std = c("Rondonia","Acre","Amazonas","Roraima","Para","Amapa","Tocantins","Maranhao","Piaui","Ceara","Rio Grande do Norte","Paraiba","Pernambuco","Alagoas","Sergipe","Bahia","Minas Gerais","Espirito Santo","Rio de Janeiro","Sao Paulo","Parana","Santa Catarina","Rio Grande do Sul","Mato Grosso do Sul","Mato Grosso","Goias","Distrito Federal"),
+  macro_region_std = c("North","North","North","North","North","North","North","Northeast","Northeast","Northeast","Northeast","Northeast","Northeast","Northeast","Northeast","Northeast","Southeast","Southeast","Southeast","Southeast","South","South","South","Center-West","Center-West","Center-West","Center-West")
+)
+
+name_candidates <- c("state_name","state","uf_name","uf","nome","nome_estado","state_nm")
+macro_candidates <- c("macro_region","region","macroregion","macro_reg","regiao","region_name","region_nm")
+name_col <- intersect(name_candidates, names(base))[1]
+macro_col <- intersect(macro_candidates, names(base))[1]
+
+base <- base |>
+  left_join(uf_lookup, by = "uf_code") |>
+  mutate(
+    state_name = if (!is.na(name_col)) as.character(.data[[name_col]]) else state_name_std,
+    state_name = ifelse(is.na(state_name) | state_name == "", state_name_std, state_name),
+    macro_region = if (!is.na(macro_col)) as.character(.data[[macro_col]]) else macro_region_std,
+    macro_region = ifelse(is.na(macro_region) | macro_region == "", macro_region_std, macro_region),
+    uf_label = paste0(uf_code, " - ", state_name)
+  )
+
+n_states <- base |> distinct(uf_code) |> nrow()
+full_months <- base |>
+  group_by(date) |>
+  summarize(
+    n_states_present = n_distinct(uf_code),
+    all_complete = all(!is.na(consumption_index) & !is.na(mp_shock) & !is.na(share_PH2M_linear) & !is.na(share_WH2M_linear) & !is.na(share_PH2M_nearest) & !is.na(share_WH2M_nearest)),
+    .groups = "drop"
+  ) |>
+  filter(n_states_present == n_states, all_complete) |>
+  pull(date)
+
+panel <- base |>
+  filter(date %in% full_months) |>
+  arrange(uf_code, date) |>
+  group_by(uf_code) |>
+  mutate(
+    log_c = log(consumption_index),
+    lag_log_c = lag(log_c, 1),
+    lag_mp_shock = lag(mp_shock, 1)
+  ) |>
+  ungroup()
+```
+
+## Functions
+
+```{r}
+horizons <- 0:12
+
+safe_get <- function(ct, term) {
+  if (inherits(ct, "try-error") || !(term %in% rownames(ct))) return(c(NA_real_, NA_real_))
+  c(unname(ct[term, "Estimate"]), unname(ct[term, "Std. Error"]))
+}
+
+wild_cluster_ci <- function(model, data, cluster_var, term, B = 399, seed = 123) {
+  set.seed(seed)
+  cl <- as.character(data[[cluster_var]])
+  clu <- unique(cl)
+  fit <- as.numeric(fitted(model))
+  res <- as.numeric(residuals(model))
+  y_name <- all.vars(formula(model))[1]
+  bvec <- numeric(B)
+  for (b in seq_len(B)) {
+    w <- sample(c(-1, 1), length(clu), replace = TRUE)
+    names(w) <- clu
+    y_star <- fit + res * w[cl]
+    d_star <- data
+    d_star[[y_name]] <- y_star
+    m_star <- try(lm(formula(model), data = d_star), silent = TRUE)
+    bvec[b] <- if (inherits(m_star, "try-error")) NA_real_ else unname(coef(m_star)[term])
+  }
+  bvec <- bvec[!is.na(bvec)]
+  c(lo = as.numeric(quantile(bvec, 0.025, na.rm = TRUE)), hi = as.numeric(quantile(bvec, 0.975, na.rm = TRUE)))
+}
+
+wild_state_ci <- function(model, term, B = 399, seed = 123) {
+  set.seed(seed)
+  fit <- as.numeric(fitted(model))
+  res <- as.numeric(residuals(model))
+  y_name <- all.vars(formula(model))[1]
+  d0 <- model.frame(model)
+  bvec <- numeric(B)
+  for (b in seq_len(B)) {
+    y_star <- fit + res * sample(c(-1, 1), length(res), replace = TRUE)
+    d_star <- d0
+    d_star[[y_name]] <- y_star
+    m_star <- try(lm(formula(model), data = d_star), silent = TRUE)
+    bvec[b] <- if (inherits(m_star, "try-error")) NA_real_ else unname(coef(m_star)[term])
+  }
+  bvec <- bvec[!is.na(bvec)]
+  c(lo = as.numeric(quantile(bvec, 0.025, na.rm = TRUE)), hi = as.numeric(quantile(bvec, 0.975, na.rm = TRUE)))
+}
+
+run_lp_pooled <- function(h, variant = c("linear", "nearest"), B = 399) {
+  variant <- match.arg(variant)
+  ph <- ifelse(variant == "linear", "share_PH2M_linear", "share_PH2M_nearest")
+  wh <- ifelse(variant == "linear", "share_WH2M_linear", "share_WH2M_nearest")
+  d <- panel |>
+    group_by(uf_code) |>
+    arrange(date, .by_group = TRUE) |>
+    mutate(y_lead = lead(log_c, h), y_resp = y_lead - lag_log_c) |>
+    ungroup() |>
+    filter(!is.na(y_resp), !is.na(lag_log_c), !is.na(lag_mp_shock), !is.na(.data[[ph]]), !is.na(.data[[wh]]))
+  rhs <- c("mp_shock", ph, wh, "lag_log_c", "lag_mp_shock", "factor(uf_code)")
+  if (dplyr::n_distinct(d$month_num) > 1) rhs <- c(rhs, "factor(month_num)")
+  if (dplyr::n_distinct(d$year) > 1) rhs <- c(rhs, "factor(year)")
+  fml <- as.formula(paste("y_resp ~", paste(rhs, collapse = " + ")))
+  m <- lm(fml, data = d)
+  ct <- coeftest(m, vcov. = vcovCL(m, cluster = ~ uf_code, type = "HC1"))
+  mp <- safe_get(ct, "mp_shock")
+  mp_w <- wild_cluster_ci(m, d, "uf_code", "mp_shock", B = B)
+  tibble(horizon = h, variant = variant, n_obs = nobs(m), beta_mp = mp[1], se_mp_cl = mp[2], lo95_mp_cl = beta_mp - 1.96 * se_mp_cl, hi95_mp_cl = beta_mp + 1.96 * se_mp_cl, lo95_mp_wild = mp_w["lo"], hi95_mp_wild = mp_w["hi"])
+}
+
+run_lp_state <- function(st, h, variant = c("linear", "nearest"), B = 399) {
+  variant <- match.arg(variant)
+  ph <- ifelse(variant == "linear", "share_PH2M_linear", "share_PH2M_nearest")
+  wh <- ifelse(variant == "linear", "share_WH2M_linear", "share_WH2M_nearest")
+  d <- panel |>
+    filter(uf_code == st) |>
+    arrange(date) |>
+    mutate(y_lead = lead(log_c, h), y_resp = y_lead - lag_log_c) |>
+    filter(!is.na(y_resp), !is.na(lag_log_c), !is.na(lag_mp_shock), !is.na(.data[[ph]]), !is.na(.data[[wh]]))
+  rhs <- c("mp_shock", ph, wh, "lag_log_c", "lag_mp_shock")
+  if (dplyr::n_distinct(d$month_num) > 1) rhs <- c(rhs, "factor(month_num)")
+  if (dplyr::n_distinct(d$year) > 1) rhs <- c(rhs, "factor(year)")
+  fml <- as.formula(paste("y_resp ~", paste(rhs, collapse = " + ")))
+  m <- lm(fml, data = d)
+  ct <- coeftest(m, vcov. = NeweyWest(m, lag = max(1, h), prewhite = FALSE, adjust = TRUE))
+  mp <- safe_get(ct, "mp_shock")
+  mp_w <- wild_state_ci(m, "mp_shock", B = B)
+  tibble(uf_code = st, horizon = h, variant = variant, beta_mp = mp[1], se_mp = mp[2], lo95_mp = beta_mp - 1.96 * se_mp, hi95_mp = beta_mp + 1.96 * se_mp, lo95_mp_wild = mp_w["lo"], hi95_mp_wild = mp_w["hi"])
+}
+```
+
+## Pooled IRFs: linear and nearest
+
+```{r}
+irf_linear <- dplyr::bind_rows(lapply(horizons, run_lp_pooled, variant = "linear", B = 399))
+irf_nearest <- dplyr::bind_rows(lapply(horizons, run_lp_pooled, variant = "nearest", B = 399))
+write.csv(irf_linear, file.path(csv_dir, "irf_lp_logcum_linear_h2m_clustered_fullmonths_wild.csv"), row.names = FALSE)
+write.csv(irf_nearest, file.path(csv_dir, "irf_lp_logcum_nearest_h2m_clustered_fullmonths_wild.csv"), row.names = FALSE)
+```
+
+## State-level IRFs (individual PNG per state)
+
+```{r}
+macro_cols <- c("North" = "#1b9e77", "Northeast" = "#d95f02", "Southeast" = "#7570b3", "South" = "#e7298a", "Center-West" = "#66a61e")
+states <- sort(unique(panel$uf_code))
+for (variant_i in c("linear", "nearest")) {
+  irf_state <- crossing(uf_code = states, horizon = horizons) |>
+    mutate(res = map2(uf_code, horizon, ~ run_lp_state(.x, .y, variant = variant_i, B = 399))) |>
+    pull(res) |>
+    list_rbind() |>
+    left_join(base |> select(uf_code, uf_label, macro_region) |> distinct(), by = "uf_code")
+  write.csv(irf_state, file.path(csv_dir, paste0("irf_state_by_state_", variant_i, ".csv")), row.names = FALSE)
+  for (st in states) {
+    d <- irf_state |> filter(uf_code == st)
+    if (nrow(d) == 0) next
+    reg <- d$macro_region[1]
+    if (is.na(reg) || !(reg %in% names(macro_cols))) reg <- "Southeast"
+    col <- macro_cols[[reg]]
+    lbl <- d$uf_label[1]
+    file_stub <- gsub("[^A-Za-z0-9]+", "_", lbl)
+    p <- d |>
+      ggplot(aes(horizon, beta_mp)) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray55") +
+      geom_ribbon(aes(ymin = lo95_mp, ymax = hi95_mp), fill = col, alpha = 0.20) +
+      geom_ribbon(aes(ymin = lo95_mp_wild, ymax = hi95_mp_wild), fill = col, alpha = 0.10) +
+      geom_line(color = col, linewidth = 0.9) +
+      geom_point(color = col, size = 1.8) +
+      scale_x_continuous(breaks = 0:12) +
+      labs(title = paste0(lbl, " (", variant_i, " H2M)"), subtitle = paste0("Macro-region: ", reg), x = "Horizon (months)", y = "Cumulative log response") +
+      theme_minimal()
+    ggsave(file.path(state_png_dir, paste0("irf_state_mp_", variant_i, "_", file_stub, ".png")), p, width = 6, height = 4, dpi = 300)
+  }
+}
+```

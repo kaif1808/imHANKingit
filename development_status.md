@@ -1,5 +1,47 @@
 # Development Status
 
+## Latest Update — 2026-04-17
+
+### Repository cleanup: moved generated artifacts under `results/` and redirected PNG defaults
+
+Reorganized output deposition so generated tables, plots, and rendered diagnostics no longer pollute the repo root.
+
+**What was done:**
+- Standardized output directories: `results/tables/`, `results/plots/`, `results/plots/state_irf/`, and `results/reports/`
+- Updated `htm_classification.py` defaults:
+  - `pof_bin_shares.csv` -> `results/tables/pof_bin_shares.csv`
+  - `state_quarter_htm_shares.csv` -> `results/tables/state_quarter_htm_shares.csv`
+  - `choropleth_htm_*.png` -> `results/plots/choropleth_htm_*.png`
+- Updated `generate_choropleths.py` defaults:
+  - `--input` now defaults to `results/tables/state_quarter_htm_shares.csv`
+  - `--output-dir` now defaults to `results/plots/`
+- Relocated existing generated root artifacts:
+  - IRF and choropleth PNGs -> `results/plots/` (state-level IRFs -> `results/plots/state_irf/`)
+  - IRF and pipeline CSV outputs -> `results/tables/`
+  - IRF rendered report outputs (`.html`, `.pdf`, `_files/`) -> `results/reports/`
+
+**Updated files:**
+- `htm_classification.py` — default output paths moved to `results/tables` and `results/plots`
+- `generate_choropleths.py` — default input/output paths moved to `results/` subfolders
+- `README.md` — documented canonical output locations and updated repo tree
+
+## Latest Update — 2026-04-16
+
+### README: Added project overview, directory tree, and repo guide
+
+Expanded `README.md` from a title-only placeholder into a practical repository guide for contributors and future analysis work.
+
+**What was done:**
+- Added a brief project description explaining the POF -> PNADC HTM classification pipeline
+- Added a 3-level directory tree with directories and key files
+- Added descriptions for `Data/`, `PNAD-C/`, `PNAD-C-Treated/`, `overleaf/`, `chloropleths/`, and `tests/`
+- Added short notes for the main scripts and notebooks
+- Added a brief run section covering dependency install, main pipeline execution, and key CLI flags
+- Documented that `BASE_DIR` in `htm_classification.py` is path-sensitive
+
+**Updated files:**
+- `README.md` — full project overview, directory tree, directory descriptions, and run instructions
+
 ## Latest Update — 2026-03-10
 
 ### Overleaf main.tex: Expanded with full report content
