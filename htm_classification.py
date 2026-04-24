@@ -10,7 +10,9 @@ the Kaplan–Violante–Weidner (2014) framework:
 
 Data sources:
   POF  2017-18  – household budget survey  (fixed-width txt)
-  PNADC – quarterly labour force survey  (CSV: pnadc_panel_5/6/7.csv)
+  PNADC – quarterly labour force survey  (Parquet: `PNAD-C-Treated/pnad_matched.parquet`
+           by default, or the path passed with `--pnad-parquet`). Schema matches the
+           previous stacked pretreated or raw panel CSVs (see `PNADC_REQUIRED_VARIABLES.md`).
 
 Steps:
   1. POF: classify each household into an agent type
@@ -38,7 +40,8 @@ import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pyreadr
+
+from pnad_faixa_pretreat import faixa_educ_to_vd3004, faixa_idade_to_age
 
 # ============================================================================
 # CONFIGURATION
@@ -61,7 +64,7 @@ MIN_WEIGHTED_N = 30          # flag bins below this
 RANDOM_SEED    = 42
 
 PNADC_DATA_DIR = BASE_DIR / "PNAD-C-Treated"
-PNADC_CSV_FILES = ["test5.csv", "test6.csv", "test7.csv"]
+PNAD_MATCHED_DEFAULT = PNADC_DATA_DIR / "pnad_matched.parquet"
 
 parser = argparse.ArgumentParser(description="HTM Agent Classification Pipeline")
 parser.add_argument("--no-choropleth", action="store_true", help="Skip choropleth map generation")
@@ -69,6 +72,12 @@ parser.add_argument(
     "--per-quarter-quintiles",
     action="store_true",
     help="Use per-quarter quintiles instead of POF cut-points (reduces seasonal bias)",
+)
+parser.add_argument(
+    "--pnad-parquet",
+    type=Path,
+    default=None,
+    help="Path to PNADC input Parquet (default: PNAD-C-Treated/pnad_matched.parquet)",
 )
 args = parser.parse_args()
 
@@ -525,19 +534,15 @@ print("\n" + "=" * 72)
 print("STEP 3: LOAD PNADC & MERGE TYPE SHARES")
 print("=" * 72)
 
-frames = []
-for fname in PNADC_CSV_FILES:
-    csv_path = PNADC_DATA_DIR / fname
-    if not csv_path.exists():
-        print(f"  ⚠  {fname} not found – skipping")
-        continue
-    print(f"  Loading {fname} …")
-    df = pd.read_csv(csv_path)
-    df["year"] = pd.to_numeric(df["Ano"], errors="coerce")
-    df["quarter"] = pd.to_numeric(df["Trimestre"], errors="coerce")
-    frames.append(df)
-
-pnadc = pd.concat(frames, ignore_index=True)
+pnad_path = args.pnad_parquet if args.pnad_parquet is not None else PNAD_MATCHED_DEFAULT
+if not pnad_path.exists():
+    raise FileNotFoundError(
+        f"PNADC Parquet not found: {pnad_path} — add the file or pass --pnad-parquet PATH"
+    )
+print(f"  Loading {pnad_path} …")
+pnadc = pd.read_parquet(pnad_path)
+pnadc["year"] = pd.to_numeric(pnadc["Ano"], errors="coerce")
+pnadc["quarter"] = pd.to_numeric(pnadc["Trimestre"], errors="coerce")
 print(f"  Total PNADC records: {len(pnadc):,}")
 
 # Detect datazoom test format (faixa_idade, no V2009) vs raw panel (V2009, VD3004)
