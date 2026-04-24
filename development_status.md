@@ -1,5 +1,42 @@
 # Development Status
 
+## Latest Update — 2026-04-20
+
+### BSE cover letter: LaTeX source and one-page PDF
+
+Added a formal predoctoral application cover letter as standalone LaTeX, compiled to a single-page PDF alongside the existing markdown draft.
+
+**What was done:**
+- Added `overleaf/coverletter/COVER_LETTER_KAI_FAULKNER_BSE.tex` (Times-style body via `newtx`, BSE letterhead with name and `kai.faulkner@bse.eu`, inside address for Professor Jan Eeckhout at BSE, subject line with ERC ref 101198932, British English via `babel`)
+- Generated `overleaf/coverletter/COVER_LETTER_KAI_FAULKNER_BSE.pdf` (verified one page via `pdfinfo`)
+- Added `overleaf/coverletter/.gitignore` for LaTeX auxiliary files (`*.aux`, `*.log`, `latexmk` files, etc.)
+
+**Build:** `cd overleaf/coverletter && latexmk -pdf -interaction=nonstopmode COVER_LETTER_KAI_FAULKNER_BSE.tex`
+
+**Updated files:**
+- `overleaf/coverletter/COVER_LETTER_KAI_FAULKNER_BSE.tex` — new
+- `overleaf/coverletter/COVER_LETTER_KAI_FAULKNER_BSE.pdf` — new
+- `overleaf/coverletter/.gitignore` — new
+- `development_status.md` — this entry
+
+## Latest Update — 2026-04-17
+
+### PNAD-C variable inventory documentation added
+
+Created a complete markdown inventory of PNAD-C variables referenced by the classification pipeline, split by supported input schema and annotated by usage/requirement level.
+
+**What was done:**
+- Added `PNADC_REQUIRED_VARIABLES.md` at repo root
+- Documented variables used in both branches (`UF`, `Ano`, `Trimestre`)
+- Documented DataZoom-pretreated branch required columns (`faixa_idade`, `sexo`, `faixa_educ`, `Habitual`, `rendimento_habitual_real`, `ID_DOMICILIO`)
+- Documented raw PNAD-C branch required columns (`V2009`, `V2007`, `VD3004`, `V1028`, `V2001`) and optional income column handling
+- Documented conditional labor-status columns (`formal`, `informal`, `ocupado`, `desocupado`, `conta_propria`, `fora_forca_trab`)
+- Added minimal input checklists and derived-column notes for both schema variants
+
+**Updated files:**
+- `PNADC_REQUIRED_VARIABLES.md` — new full variable inventory for PNAD-C pipeline inputs
+- `development_status.md` — logged this documentation update
+
 ## Latest Update — 2026-04-17
 
 ### Repository cleanup: moved generated artifacts under `results/` and redirected PNG defaults
