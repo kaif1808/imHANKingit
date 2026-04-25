@@ -9,4 +9,4 @@ savepath;
 
 rehash toolboxcache;
 cd('C:\Users\HP\Desktop\Fiscal Policy\Fiscal Policy\Psets');
-dynare NK_Gali2015_IRFs.mod
+% dynare XX.mod add you file name here with the structural model
