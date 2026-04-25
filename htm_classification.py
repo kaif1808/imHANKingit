@@ -712,6 +712,38 @@ print("  └──────────────┴───────�
 
 
 ###############################################################################
+#      STEP 4b – EXPORT INDIVIDUAL-LEVEL AGENT-TYPE LABELS
+###############################################################################
+print("\n" + "=" * 72)
+print("STEP 4b: INDIVIDUAL-LEVEL AGENT-TYPE EXPORT")
+print("=" * 72)
+
+for t in ["PH2M", "WH2M", "Ricardian"]:
+    pnadc[f"is_{t}"] = (pnadc["agent_type"] == t).astype("int8")
+
+_ind_cols_wanted = [
+    "id_ind", "id_dom",
+    "year", "quarter",
+    "uf_code",
+    "weight",
+    "macro_region", "age_group", "gender",
+    "education_group", "labor_status", "pc_income_quintile",
+    "p_ph2m", "p_wh2m", "p_ric",
+    "agent_type",
+    "is_PH2M", "is_WH2M", "is_Ricardian",
+]
+ind_export_cols = [c for c in _ind_cols_wanted if c in pnadc.columns]
+
+ind_df = pnadc[ind_export_cols].copy()
+out_path_ind = TABLES_DIR / "individual_agent_types.parquet"
+ind_df.to_parquet(out_path_ind, index=False)
+print(f"\n  Saved {len(ind_df):,} individual-quarter rows → {out_path_ind}")
+print(f"  Columns: {ind_export_cols}")
+print(f"\n  Type distribution (unweighted):")
+print(ind_df["agent_type"].value_counts().to_string())
+
+
+###############################################################################
 #       STEP 5 – AGGREGATE TO STATE × QUARTER TYPE SHARES
 ###############################################################################
 print("\n" + "=" * 72)
@@ -889,5 +921,6 @@ if not args.no_choropleth:
 print("\n✅ Pipeline complete. Output files:")
 print(f"   • {out_path_bins}")
 print(f"   • {out_path_sq}")
+print(f"   • {out_path_ind}")
 if choropleth_generated:
     print(f"   • choropleth_htm_*.png (per quarter)")
