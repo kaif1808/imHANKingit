@@ -1,5 +1,20 @@
 # Development Status
 
+## Latest Update — 2026-04-24
+
+### HTM pipeline: PNADC input from `pnad_matched.parquet`
+
+Switched the PNAD-C stage of `htm_classification.py` from reading and stacking multiple pretreated CSVs to a single Parquet file, with a CLI override and explicit error if the file is missing.
+
+**What was done:**
+
+- **Input:** `pd.read_parquet` on `PNAD-C-Treated/pnad_matched.parquet` by default, or `--pnad-parquet PATH`.
+- **Dependencies:** added `pyarrow` to `requirements.txt` for reliable Parquet I/O.
+- **Pretreated format:** added `pnad_faixa_pretreat.py` with `faixa_idade_to_age` and `faixa_educ_to_vd3004` (DataZoom string labels → numeric age and VD3004 codes), plus `tests/test_pnad_faixa_pretreat.py`.
+- **Fix:** `argparse.ArgumentParser` name typo; removed unused `pyreadr` import from the classification script.
+
+**Updated files:** `htm_classification.py`, `requirements.txt`, `pnad_faixa_pretreat.py`, `tests/test_pnad_faixa_pretreat.py`, `development_status.md`
+
 ## Latest Update — 2026-04-20
 
 ### BSE cover letter: LaTeX source and one-page PDF
