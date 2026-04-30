@@ -1,0 +1,239 @@
+#
+# IRF on consume_state: Cumulative log consumption response to MP shock
+
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lmtest)
+library(sandwich)
+library(purrr)
+
+# Data
+base <- read.csv("C:/Users/HP/Downloads/panel_consume_mp.csv") |>
+  mutate(
+    year_month = as.character(year_month),
+    year       = as.integer(year),
+    month_num  = as.integer(month_num),
+    uf_code    = as.integer(uf_code),
+    date       = as.integer(date)
+  ) |>
+  arrange(uf_code, date)
+
+n_states <- base |>
+  distinct(uf_code) |>
+  nrow()
+
+full_months <- base |>
+  group_by(date) |>
+  summarize(
+    n_states_present = n_distinct(uf_code),
+    all_complete = all(
+      !is.na(consumption_index) &
+      !is.na(mp_shock)
+    ),
+    .groups = "drop"
+  ) |>
+  filter(n_states_present == n_states, all_complete) |>
+  pull(date)
+
+panel <- base |>
+  filter(date %in% full_months) |>
+  group_by(uf_code) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(
+    log_c        = log(consumption_index),
+    lag_log_c    = dplyr::lag(log_c, 1),
+    lag_mp_shock = dplyr::lag(mp_shock, 1)
+  ) |>
+  ungroup()
+
+sample_info <- tibble(
+  n_states       = n_states,
+  n_full_months  = length(full_months),
+  min_full_month = min(full_months),
+  max_full_month = max(full_months)
+)
+sample_info
+
+# Pooled LP with 12 time periods (adjustable) and SEs clustered by uf_code
+horizons <- 0:12
+
+safe_get <- function(ct, term) {
+  if (!term %in% rownames(ct)) return(c(NA_real_, NA_real_))
+  c(unname(ct[term, "Estimate"]), unname(ct[term, "Std. Error"]))
+}
+
+run_lp_cluster <- function(h) {
+  d <- panel |>
+    group_by(uf_code) |>
+    arrange(date, .by_group = TRUE) |>
+    mutate(
+      y_lead = dplyr::lead(log_c, h),
+      y_resp = y_lead - lag_log_c
+    ) |>
+    ungroup() |>
+    filter(!is.na(y_resp), !is.na(lag_log_c), !is.na(lag_mp_shock))
+
+  use_month_fe <- n_distinct(d$month_num) > 1
+  use_year_fe  <- n_distinct(d$year) > 1
+
+  rhs <- c(
+    "mp_shock",
+    "lag_log_c",
+    "lag_mp_shock",
+    "factor(uf_code)"
+  )
+  if (use_month_fe) rhs <- c(rhs, "factor(month_num)")
+  if (use_year_fe)  rhs <- c(rhs, "factor(year)")
+
+  fml <- as.formula(paste("y_resp ~", paste(rhs, collapse = " + ")))
+  m   <- lm(fml, data = d)
+
+  Vcl <- vcovCL(m, cluster = ~ uf_code, type = "HC1")
+  ct  <- coeftest(m, vcov. = Vcl)
+
+  mp <- safe_get(ct, "mp_shock")
+
+  tibble(
+    horizon    = h,
+    n_obs      = nobs(m),
+    beta_mp    = mp[1],
+    se_mp_cl   = mp[2],
+    lo95_mp_cl = beta_mp - 1.96 * se_mp_cl,
+    hi95_mp_cl = beta_mp + 1.96 * se_mp_cl
+  )
+}
+
+irf_results_cluster <- bind_rows(lapply(horizons, run_lp_cluster))
+
+write.csv(
+  irf_results_cluster,
+  "irf_lp_consume_state_clustered.csv",
+  row.names = FALSE
+)
+irf_results_cluster
+
+# Plot with 95% CI
+p_mp <- irf_results_cluster |>
+  ggplot(aes(x = horizon, y = beta_mp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = lo95_mp_cl, ymax = hi95_mp_cl), alpha = 0.2, fill = "#2C7FB8") +
+  geom_line(color = "#2C7FB8", linewidth = 1) +
+  geom_point(color = "#2C7FB8", size = 2) +
+  scale_x_continuous(breaks = 0:12) +
+  labs(
+    title = "IRF: Cumulative Log Consumption Response to MP Shock (Pooled)",
+    x     = "Horizon (months)",
+    y     = "Response (log points)"
+  ) +
+  theme_minimal()
+p_mp
+
+ggsave("irf_mp_shock_consume_state_clustered.png",
+       p_mp, width = 8, height = 5, dpi = 300)
+
+# State-by-state LP decomposition
+
+run_lp_state_h <- function(st, h) {
+  d <- panel |>
+    filter(uf_code == st) |>
+    arrange(date) |>
+    mutate(
+      y_lead = dplyr::lead(log_c, h),
+      y_resp = y_lead - lag_log_c
+    ) |>
+    filter(!is.na(y_resp), !is.na(lag_log_c), !is.na(lag_mp_shock))
+
+  use_month_fe <- n_distinct(d$month_num) > 1
+  use_year_fe  <- n_distinct(d$year) > 1
+
+  rhs <- c(
+    "mp_shock",
+    "lag_log_c",
+    "lag_mp_shock"
+  )
+  if (use_month_fe) rhs <- c(rhs, "factor(month_num)")
+  if (use_year_fe)  rhs <- c(rhs, "factor(year)")
+
+  fml <- as.formula(paste("y_resp ~", paste(rhs, collapse = " + ")))
+  m   <- lm(fml, data = d)
+
+  Vnw <- NeweyWest(m, lag = max(1, h), prewhite = FALSE, adjust = TRUE)
+  ct  <- coeftest(m, vcov. = Vnw)
+
+  mp <- safe_get(ct, "mp_shock")
+
+  tibble(
+    uf_code = st,
+    horizon = h,
+    n_obs   = nobs(m),
+    beta_mp = mp[1],
+    se_mp   = mp[2],
+    lo95_mp = beta_mp - 1.96 * se_mp,
+    hi95_mp = beta_mp + 1.96 * se_mp
+  )
+}
+
+states <- sort(unique(panel$uf_code))
+
+irf_state <- crossing(uf_code = states, horizon = horizons) |>
+  mutate(res = map2(uf_code, horizon, run_lp_state_h)) |>
+  pull(res) |>
+  list_rbind()
+
+write.csv(irf_state, "irf_state_by_state_consume_state.csv", row.names = FALSE)
+
+irf_state |>
+  group_by(uf_code) |>
+  summarize(min_obs = min(n_obs), max_obs = max(n_obs), .groups = "drop")
+
+# Plot of state-specific IRF's
+p_mp_state <- irf_state |>
+  ggplot(aes(horizon, beta_mp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray55") +
+  geom_ribbon(aes(ymin = lo95_mp, ymax = hi95_mp), fill = "#2C7FB8", alpha = 0.18) +
+  geom_line(color = "#2C7FB8", linewidth = 0.7) +
+  facet_wrap(~ uf_code, scales = "free_y") +
+  scale_x_continuous(breaks = 0:15) +
+  labs(
+    title = "State-Specific IRFs: MP Shock",
+    x     = "Horizon (months)",
+    y     = "Cumulative log response"
+  ) +
+  theme_minimal(base_size = 10)
+p_mp_state
+
+ggsave("irf_state_by_state_mp_consume_state.png",
+       p_mp_state, width = 14, height = 10, dpi = 300)
+
+# 
+# - Consumption enters as log(consumption_index); responses are cumulative
+#   log deviations from t-1, directly comparable across horizons.
+# - Balanced panel: 27 states x 48 months (2016.01 - 2019.12) with no gaps,
+#   since the H2M covariates were dropped (they were the binding missingness
+#   constraint in the previous spec, which left only 22 usable months).
+# - Pooled regression uses state + month + year fixed effects; SEs clustered
+#   by uf_code. Per-state regressions use Newey-West HAC with bandwidth
+#   max(1, h) at horizon h.
+
+
+# Pooled local projection setup
+#
+# Model at each horizon h in {0, ..., 12}:
+#   y_{i,t+h} - y_{i,t-1} = beta_h * mp_shock_{i,t}
+#                         + gamma_h' X_{i,t}
+#                         + alpha_i + delta_m + tau_y + eps_{i,t+h}
+#
+# where y_{i,t} = log(consumption_index_{i,t}),
+#       X_{i,t} includes lag_log_c, lag_mp_shock,
+#       standard errors are clustered by state (uf_code).
+#
+
+# State by state local projection setup
+# For each state s, estimate:
+#   y_{s,t+h} - y_{s,t-1} = beta_{s,h} * mp_shock_{s,t}
+#                         + gamma_{s,h}' X_{s,t}
+#                         + delta_m + tau_y + u_{s,t+h}
+# with HAC (Newey-West) standard errors within each state time series.
+# -----------------------------------------------------------------------------
