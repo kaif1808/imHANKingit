@@ -1,0 +1,227 @@
+
+# Panel VAR(1) IRF: Log consumption response to MP shock (pooled clustered + state-by-state)
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lmtest)
+library(sandwich)
+library(purrr)
+
+# Data
+base <- read.csv("C:/Users/HP/Downloads/panel_consume_mp.csv") |>
+  mutate(
+    year_month = as.character(year_month),
+    year       = as.integer(year),
+    month_num  = as.integer(month_num),
+    uf_code    = as.integer(uf_code),
+    date       = as.integer(date)
+  ) |>
+  arrange(uf_code, date)
+
+n_states <- n_distinct(base$uf_code)
+
+full_months <- base |>
+  group_by(date) |>
+  summarize(
+    n_states_present = n_distinct(uf_code),
+    all_complete = all(!is.na(consumption_index) & !is.na(mp_shock)),
+    .groups = "drop"
+  ) |>
+  filter(n_states_present == n_states, all_complete) |>
+  pull(date)
+
+panel <- base |>
+  filter(date %in% full_months) |>
+  group_by(uf_code) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(
+    log_c        = log(consumption_index),
+    lag_log_c    = dplyr::lag(log_c, 1),
+    lag_mp_shock = dplyr::lag(mp_shock, 1)
+  ) |>
+  ungroup()
+
+d_var <- panel |> filter(!is.na(lag_log_c), !is.na(lag_mp_shock))
+
+sample_info <- tibble(
+  n_states       = n_states,
+  n_full_months  = length(full_months),
+  min_full_month = min(full_months),
+  max_full_month = max(full_months)
+)
+sample_info
+
+# 2. Panel VAR(1) setup
+
+fit_A <- function(d) {
+  use_month_fe <- n_distinct(d$month_num) > 1
+  use_year_fe  <- n_distinct(d$year)      > 1
+  use_uf_fe    <- n_distinct(d$uf_code)   > 1
+
+  rhs <- c("lag_mp_shock", "lag_log_c")
+  if (use_uf_fe)    rhs <- c(rhs, "factor(uf_code)")
+  if (use_month_fe) rhs <- c(rhs, "factor(month_num)")
+  if (use_year_fe)  rhs <- c(rhs, "factor(year)")
+
+  f1 <- as.formula(paste("mp_shock ~", paste(rhs, collapse = " + ")))
+  f2 <- as.formula(paste("log_c    ~", paste(rhs, collapse = " + ")))
+
+  eq1 <- lm(f1, data = d)
+  eq2 <- lm(f2, data = d)
+
+  A <- matrix(
+    c(coef(eq1)["lag_mp_shock"], coef(eq1)["lag_log_c"],
+      coef(eq2)["lag_mp_shock"], coef(eq2)["lag_log_c"]),
+    nrow = 2, byrow = TRUE,
+    dimnames = list(c("mp_shock", "log_c"),
+                    c("lag_mp_shock", "lag_log_c"))
+  )
+  list(A = A, eq1 = eq1, eq2 = eq2)
+}
+
+compute_irf <- function(A, H = 12) {
+  e   <- c(1, 0)                                      # unit shock to mp_shock
+  out <- matrix(NA_real_, nrow = H + 1, ncol = 2,
+                dimnames = list(NULL, c("mp_shock", "log_c")))
+  out[1, ] <- e
+  Ah <- diag(2)
+  for (h in seq_len(H)) {
+    Ah         <- Ah %*% A
+    out[h + 1, ] <- Ah %*% e
+  }
+  as_tibble(out) |>
+    mutate(horizon = 0:H) |>
+    select(horizon, mp_shock, log_c)
+}
+
+fit       <- fit_A(d_var)
+A_hat     <- fit$A
+irf_point <- compute_irf(A_hat, H = 12)
+
+A_hat
+irf_point
+
+# Cluster bootstrap over states for 95% CI +
+# Resample states with replacement (27 per draw), re-estimate A, re-iterate IRF.
+
+set.seed(123)
+B <- 500
+states_vec <- sort(unique(d_var$uf_code))
+
+boot_irfs <- vector("list", B)
+
+for (b in seq_len(B)) {
+  sampled <- sample(states_vec, size = length(states_vec), replace = TRUE)
+  d_b <- bind_rows(lapply(seq_along(sampled), function(k) {
+    d_var |>
+      filter(uf_code == sampled[k]) |>
+      mutate(uf_code = 10000L + k)   # unique id so FEs are not collapsed across draws
+  }))
+
+  A_b <- try(fit_A(d_b)$A, silent = TRUE)
+  if (inherits(A_b, "try-error") || any(!is.finite(A_b))) {
+    boot_irfs[[b]] <- NULL
+    next
+  }
+  boot_irfs[[b]] <- compute_irf(A_b, H = 12) |> mutate(b = b)
+}
+
+boot_df <- bind_rows(boot_irfs)
+
+irf_ci <- boot_df |>
+  group_by(horizon) |>
+  summarize(
+    lo95_mp = quantile(mp_shock, 0.025, na.rm = TRUE),
+    hi95_mp = quantile(mp_shock, 0.975, na.rm = TRUE),
+    lo95_c  = quantile(log_c,    0.025, na.rm = TRUE),
+    hi95_c  = quantile(log_c,    0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+irf_var <- irf_point |> left_join(irf_ci, by = "horizon")
+
+write.csv(irf_var, "irf_var1_consume_state_bootstrap.csv", row.names = FALSE)
+irf_var
+
+# Plot: log consumption IRF from VAR(1)
+p_var <- irf_var |>
+  ggplot(aes(x = horizon, y = log_c)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = lo95_c, ymax = hi95_c), alpha = 0.2, fill = "#2C7FB8") +
+  geom_line(color = "#2C7FB8", linewidth = 1) +
+  geom_point(color = "#2C7FB8", size = 2) +
+  scale_x_continuous(breaks = 0:12) +
+  labs(
+    title    = "Panel VAR(1) IRF: Log Consumption Response to MP Shock",
+    subtitle = "95% CI from cluster bootstrap over states (B = 500)",
+    x        = "Horizon (months)",
+    y        = "Response (log points)"
+  ) +
+  theme_minimal()
+p_var
+
+ggsave("irf_var1_consume_state.png", p_var, width = 8, height = 5, dpi = 300)
+
+# State-by-state VAR(1) decomposition
+# Estimating A separately for each state; iterate IRF.
+
+run_var_state <- function(st) {
+  d_s <- d_var |> filter(uf_code == st) |> arrange(date)
+  fit <- try(fit_A(d_s), silent = TRUE)
+  if (inherits(fit, "try-error") || any(!is.finite(fit$A))) {
+    return(tibble(uf_code = st, horizon = 0:12,
+                  mp_shock = NA_real_, log_c = NA_real_))
+  }
+  compute_irf(fit$A, H = 12) |> mutate(uf_code = st)
+}
+
+irf_state <- lapply(sort(unique(panel$uf_code)), run_var_state) |> bind_rows()
+write.csv(irf_state, "irf_var1_state_by_state.csv", row.names = FALSE)
+
+p_state <- irf_state |>
+  ggplot(aes(horizon, log_c)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray55") +
+  geom_line(color = "#2C7FB8", linewidth = 0.7) +
+  facet_wrap(~ uf_code, scales = "free_y") +
+  scale_x_continuous(breaks = 0:12) +
+  labs(
+    title = "State-Specific VAR(1) IRFs: Log Consumption to MP Shock",
+    x     = "Horizon (months)",
+    y     = "Response (log points)"
+  ) +
+  theme_minimal(base_size = 10)
+p_state
+
+ggsave("irf_var1_state_by_state.png", p_state, width = 14, height = 10, dpi = 300)
+
+# Notes:
+# - Reduced-form VAR(1) in (mp_shock, log_c), state + month + year FE, OLS.
+#   A unit shock to mp_shock's residual is propagated through A^h; log_c's
+#   trajectory is reported.
+# - Since mp_shock is externally identified, the variable ordering is
+#   inconsequential - u1_t is already a plausible structural MP innovation,
+#   and the AR(1) coefficient on mp_shock is typically small.
+# - CIs from cluster-bootstrap over states (B = 500). With T = 48 months the
+#   Nickell bias from state FE is small; if concerning, swap in an
+#   Arellano-Bond / forward-demeaned estimator.
+# - VAR-implied IRFs impose the AR(1) dynamics at every horizon, so they are
+#   smoother than the LP IRFs but more sensitive to misspecification of the
+#   lag structure. Compare the two: if they diverge sharply at longer horizons,
+#   that's a signal to add more lags or prefer the LP.
+
+
+# How to construct the vector
+# Two equations, estimated equation-by-equation with OLS and state/month/year FE:
+#   mp_shock_t = a11 * mp_shock_{t-1} + a12 * log_c_{t-1}
+#                + alpha_i + delta_m + tau_y + u1_t
+#   log_c_t    = a21 * mp_shock_{t-1} + a22 * log_c_{t-1}
+#                + alpha_i + delta_m + tau_y + u2_t
+#
+# Companion matrix:
+#   A = [[a11, a12], [a21, a22]]
+#
+# IRF to a unit shock to mp_shock (e = [1, 0]'):
+#   response at horizon h  =  A^h %*% e
+# so log_c's response at h is element (2,1) of A^h.
+#
