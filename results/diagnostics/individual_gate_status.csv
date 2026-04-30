@@ -1,0 +1,2 @@
+individual_file,has_consumption_column,consumption_column,has_month_key,has_quarter_key,has_state_key,has_type_key,status
+/Users/kai/Desktop/imHANKingit/results/tables/individual_agent_types.parquet,False,,False,True,True,True,fail
