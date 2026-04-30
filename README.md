@@ -50,7 +50,6 @@ The resulting type shares are transferred to the PNADC quarterly labour-force su
 │   ├── test5.csv
 │   ├── test6.csv
 │   └── test7.csv
-├── chloropleths/  (empty/legacy)
 ├── results/
 │   ├── tables/
 │   │   ├── pof_bin_shares.csv
@@ -69,14 +68,26 @@ The resulting type shares are transferred to the PNADC quarterly labour-force su
 │   ├── main.tex
 │   └── Graphs/
 │       └── choropleth_htm_*.png
+├── scripts/
+│   ├── data_prep/
+│   │   ├── pnad.r
+│   │   └── install.R
+│   ├── reporting/
+│   │   └── irf_heterogeneity_final.R
+│   ├── utils/
+│   │   ├── convert_report_to_notebook.py
+│   │   └── fix_notebook_markdown.py
+│   └── README.md
+├── analysis/
+│   ├── test.r
+│   └── test_approach_b.R
+├── archive/
+│   └── legacy/
+│       └── irf_heterogeneity_analysis.R
 ├── tests/
 │   └── test_htm_quintiles.py
 ├── htm_classification.py
 ├── generate_choropleths.py
-├── convert_report_to_notebook.py
-├── fix_notebook_markdown.py
-├── pnad.r
-├── install.R
 ├── main.ipynb
 ├── htm_classification_report.ipynb
 ├── htm_classification_report.html
@@ -99,14 +110,22 @@ The resulting type shares are transferred to the PNADC quarterly labour-force su
 - Pre-filtered and derived PNADC CSVs for the Python pipeline.
 - The main script currently expects `test5.csv`, `test6.csv`, and `test7.csv` (plus optional `pnadc_panel_5/6/7.csv`).
 
-`chloropleths/`
-- Kept as an empty/legacy folder.
-
 `results/`
 - Canonical destination for generated artifacts to keep repo root clean.
 - `results/tables/`: generated CSV outputs from pipeline and diagnostics.
 - `results/plots/`: generated PNG outputs (choropleths and IRFs).
 - `results/reports/`: rendered analysis reports and companion `_files/` directories.
+- `RESULTS_PROVENANCE.md`: artifact-to-script reproducibility mapping with rerun commands.
+
+`scripts/`
+- Organized location for non-core scripts. See `scripts/README.md` for canonical flow, deprecations, and guardrails.
+
+`analysis/`
+- Exploratory one-off scripts that are not part of the canonical production pipeline.
+
+`archive/legacy/`
+- Historical/superseded scripts retained for reference only.
+- `archive/legacy/root_loose_files/` stores previously root-level ad hoc data/media files outside the canonical workflow.
 
 `overleaf/`
 - LaTeX project files for the written report/presentation.
@@ -128,14 +147,19 @@ The resulting type shares are transferred to the PNADC quarterly labour-force su
 - Generates per-quarter choropleth figures from `results/tables/state_quarter_htm_shares.csv` (downloads IBGE state boundaries).
 - Default output directory: `results/plots/`.
 
-`convert_report_to_notebook.py` and `fix_notebook_markdown.py`
+`scripts/utils/convert_report_to_notebook.py` and `scripts/utils/fix_notebook_markdown.py`
 - Utilities for converting and cleaning the exported HTML report into `htm_classification_report.ipynb`.
 
-`pnad.r`
+`scripts/data_prep/pnad.r`
 - Helper script for pre-filtering large PNADC panel files into smaller CSV inputs used by the Python pipeline.
 
-`install.R`
+`scripts/data_prep/install.R`
 - Minimal R setup helper for installing the `datazoom.social` dependency.
+
+## Where scripts live
+- Canonical run targets stay in root: `htm_classification.py`, `generate_choropleths.py`, `cumulative_irf_heterogeneity.py`.
+- Supporting scripts are organized under `scripts/` by intent (`data_prep`, `reporting`, `utils`).
+- Exploratory scripts live in `analysis/`; retired/superseded scripts live in `archive/legacy/`.
 
 `main.ipynb`, `htm_classification_report.ipynb`, `htm_classification_report.html`
 - Analysis notebooks and the rendered HTML report for the classification and results.
