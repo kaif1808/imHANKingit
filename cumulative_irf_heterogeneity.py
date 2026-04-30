@@ -16,7 +16,10 @@ Outputs:
 """
 
 from pathlib import Path
+import os
 
+os.environ.setdefault("XDG_CACHE_HOME", str(Path("/tmp") / "xdg-cache"))
+os.environ.setdefault("MPLCONFIGDIR", str(Path("/tmp") / "matplotlib"))
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -126,8 +129,26 @@ def coefs_to_type_irfs(coef_df: pd.DataFrame, mean_ph2m: float, mean_wh2m: float
     return pd.DataFrame(records)
 
 # ---------------------------------------------------------------------------
-# Step 1: interpolate quarterly HtM shares to monthly
+# Step 1: load monthly HtM shares, with legacy quarterly fallback
 # ---------------------------------------------------------------------------
+
+def load_htm_monthly(monthly_path: Path, fallback_quarterly_path: Path) -> pd.DataFrame:
+    if monthly_path.exists():
+        htm = pd.read_parquet(monthly_path)
+        htm["uf_code"] = htm["uf_code"].astype(int)
+        htm["year"] = htm["year"].astype(int)
+        if "month_num" not in htm.columns:
+            if "month" not in htm.columns:
+                raise ValueError(f"{monthly_path} must contain either month or month_num")
+            htm["month_num"] = htm["month"].astype(int)
+        htm["month_num"] = htm["month_num"].astype(int)
+        return htm[
+            ["uf_code", "year", "month_num", "share_PH2M", "share_WH2M", "share_Ricardian"]
+        ].copy()
+
+    print(f"Monthly HtM parquet not found at {monthly_path}; falling back to quarterly interpolation.")
+    return interpolate_htm_to_monthly(fallback_quarterly_path)
+
 
 def interpolate_htm_to_monthly(htm_path: Path) -> pd.DataFrame:
     htm = pd.read_csv(htm_path)
@@ -500,8 +521,11 @@ def main():
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("Interpolating quarterly HtM shares to monthly...")
-    htm_monthly = interpolate_htm_to_monthly(DATA_DIR / "state_quarter_htm_shares.csv")
+    print("Loading monthly HtM shares...")
+    htm_monthly = load_htm_monthly(
+        DATA_DIR / "state_month_htm_shares.parquet",
+        DATA_DIR / "state_quarter_htm_shares.csv",
+    )
 
     print("Building enriched panel...")
     panel = build_panel(DATA_DIR / "aggregate_state_monthly_shock_h2m.csv", htm_monthly)

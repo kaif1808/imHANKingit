@@ -4,7 +4,7 @@ This directory contains non-core scripts organized by purpose.
 
 ## Canonical Entry Points (Kept in Repo Root)
 
-- `htm_classification.py` — main POF -> PNADC classification pipeline.
+- `htm_classification.py` — main POF -> streamed monthly PNADC classification pipeline.
 - `generate_choropleths.py` — standalone choropleth generation from state-quarter shares.
 - `cumulative_irf_heterogeneity.py` — state-level monthly IRF heterogeneity workflow.
 
@@ -30,7 +30,7 @@ This directory contains non-core scripts organized by purpose.
 
 ## Canonical Workflow
 
-1. Optional prep: `scripts/data_prep/pnad.r`
+1. Optional prep: produce or update `pnadc_matched_with_periods.parquet`
 2. Classify: `python3 htm_classification.py`
 3. Heterogeneity IRFs: `python3 cumulative_irf_heterogeneity.py`
 4. Choropleths (standalone rerun): `python3 generate_choropleths.py`

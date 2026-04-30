@@ -1,89 +1,109 @@
 #!/usr/bin/env python3
 """
 HTM Agent Classification Pipeline
-==================================
-Classifies Brazilian households into three agent types following
-the Kaplan–Violante–Weidner (2014) framework:
-  - Poor Hand-to-Mouth  (PH2M)
-  - Wealthy Hand-to-Mouth (WH2M)
-  - Ricardian
+=================================
 
-Data sources:
-  POF  2017-18  – household budget survey  (fixed-width txt)
-  PNADC – quarterly labour force survey  (Parquet: `PNAD-C-Treated/pnad_matched.parquet`
-           by default, or the path passed with `--pnad-parquet`). Schema matches the
-           previous stacked pretreated or raw panel CSVs (see `PNADC_REQUIRED_VARIABLES.md`).
+Classifies Brazilian households into three agent types following the
+Kaplan-Violante-Weidner framework:
 
-Steps:
-  1. POF: classify each household into an agent type
-  2. POF: build demographic bins & compute weighted type shares
-  3. PNADC: build identical bins & merge type shares
-  4. PNADC: Monte Carlo type assignment
-  5. PNADC: aggregate to state–quarter shares
-  6. Generate choropleth maps per quarter
+- PH2M: Poor Hand-to-Mouth
+- WH2M: Wealthy Hand-to-Mouth
+- Ricardian
+
+The POF stage classifies households and builds demographic bin shares.
+The PNADC stage streams a monthly matched parquet in batches, transfers
+POF bin probabilities, and writes canonical state-month expected shares.
+Monte Carlo state-month shares are written as a diagnostic.
 """
 
-import warnings
-warnings.filterwarnings("ignore")
+from __future__ import annotations
 
 import argparse
-import io
-import ssl
-import tempfile
-import zipfile
+import warnings
 from pathlib import Path
-from urllib import request as urllib_request
+from typing import Any
 
-import geopandas as gpd
-import matplotlib.colors as mcolors
-import matplotlib.patheffects as pe
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
-from pnad_faixa_pretreat import faixa_educ_to_vd3004, faixa_idade_to_age
+warnings.filterwarnings("ignore")
+
 
 # ============================================================================
-# CONFIGURATION
+# Configuration
 # ============================================================================
-BASE_DIR   = Path("/Users/kai/Desktop/imHANKingit")
-DATA_DIR   = BASE_DIR / "Data" / "Dados_20230713"
-DICT_FILE  = BASE_DIR / "Data" / "Documentacao_20230713" / "Dicionarios de variaveis.xls"
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "Data" / "Dados_20230713"
+DICT_FILE = BASE_DIR / "Data" / "Documentacao_20230713" / "Dicionarios de variaveis.xls"
 RESULTS_DIR = BASE_DIR / "results"
 TABLES_DIR = RESULTS_DIR / "tables"
 PLOTS_DIR = RESULTS_DIR / "plots"
+DIAGNOSTICS_DIR = RESULTS_DIR / "diagnostics"
 
-SELIC_RATE     = 0.09        # SELIC ≈ 9% for 2017-18
-LIQUID_THRESH  = 0.50        # liquid_assets / monthly_income threshold
-ILLIQUID_MULT  = 3           # illiquid_assets / monthly_income threshold
-POVERTY_LINE   = 170.0       # BRL per-capita monthly (Bolsa Família line)
-PENSION_MULT   = 1           # months of pension income as liquid buffer
-SAVINGS_FRAC   = 0.50        # fraction of income surplus treated as savings
-ALPHA_SMOOTH   = 0.1         # Dirichlet smoothing parameter
-MIN_WEIGHTED_N = 30          # flag bins below this
-RANDOM_SEED    = 42
+PNAD_MATCHED_DEFAULT = BASE_DIR / "pnadc_matched_with_periods.parquet"
 
-PNADC_DATA_DIR = BASE_DIR / "PNAD-C-Treated"
-PNAD_MATCHED_DEFAULT = PNADC_DATA_DIR / "pnad_matched.parquet"
+SELIC_RATE = 0.09
+LIQUID_THRESH = 0.50
+ILLIQUID_MULT = 3
+POVERTY_LINE = 170.0
+PENSION_MULT = 1
+SAVINGS_FRAC = 0.50
+ALPHA_SMOOTH = 0.1
+MIN_WEIGHTED_N = 30
+RANDOM_SEED = 42
+DEFAULT_BATCH_SIZE = 500_000
 
-parser = argparse.ArgumentParser(description="HTM Agent Classification Pipeline")
-parser.add_argument("--no-choropleth", action="store_true", help="Skip choropleth map generation")
-parser.add_argument(
-    "--per-quarter-quintiles",
-    action="store_true",
-    help="Use per-quarter quintiles instead of POF cut-points (reduces seasonal bias)",
-)
-parser.add_argument(
-    "--pnad-parquet",
-    type=Path,
-    default=None,
-    help="Path to PNADC input Parquet (default: PNAD-C-Treated/pnad_matched.parquet)",
-)
-args = parser.parse_args()
+AGENT_TYPES = ["PH2M", "WH2M", "Ricardian"]
+QUINTILE_LABELS = ["Q1", "Q2", "Q3", "Q4", "Q5"]
+MONTHLY_KEYS = ["uf_code", "year", "month", "ref_month_yyyymm"]
+FINAL_MONTHLY_COLUMNS = [
+    "uf_code",
+    "year",
+    "month",
+    "ref_month_yyyymm",
+    "share_PH2M",
+    "share_WH2M",
+    "share_Ricardian",
+    "share_H2M",
+    "total_weight",
+    "n_obs",
+    "n_unmatched",
+]
+
+PNADC_REQUIRED_COLUMNS = [
+    "UF",
+    "V2009",
+    "V2007",
+    "VD3004",
+    "V2001",
+    "rendimento_habitual_real",
+    "ref_month_yyyymm",
+    "ref_month_in_year",
+    "weight_monthly",
+]
+PNADC_ID_COLUMNS = ["id_rs", "id_ind"]
+PNADC_OPTIONAL_COLUMNS = [
+    "formal",
+    "conta_propria",
+    "informal",
+    "ocupado",
+    "desocupado",
+    "fora_forca_trab",
+    "Ano",
+    "Trimestre",
+    "V1028",
+    "Habitual",
+]
+PNADC_BATCH_COLUMNS = PNADC_REQUIRED_COLUMNS + PNADC_ID_COLUMNS + PNADC_OPTIONAL_COLUMNS
+
 
 # ============================================================================
-# HELPER: read POF fixed-width file using the Excel dictionary
+# POF helpers
 # ============================================================================
+
+
 def read_pof_table(txt_filename: str, sheet_name: str) -> pd.DataFrame:
     """Read a POF fixed-width text file using positions from the dictionary."""
     print(f"  Reading POF table: {txt_filename} (sheet={sheet_name})")
@@ -95,59 +115,36 @@ def read_pof_table(txt_filename: str, sheet_name: str) -> pd.DataFrame:
     layout["start"] = layout["start"].astype(int)
     layout["width"] = layout["width"].astype(int)
 
-    colspecs = [(r["start"] - 1, r["start"] - 1 + r["width"])
-                for _, r in layout.iterrows()]
+    colspecs = [
+        (row["start"] - 1, row["start"] - 1 + row["width"])
+        for _, row in layout.iterrows()
+    ]
     names = layout["var_name"].tolist()
-
-    df = pd.read_fwf(
-        DATA_DIR / txt_filename,
-        colspecs=colspecs,
-        names=names,
-        dtype=str
-    )
-    return df
+    return pd.read_fwf(DATA_DIR / txt_filename, colspecs=colspecs, names=names, dtype=str)
 
 
-# ============================================================================
-# HELPER: UF code → macro-region
-# ============================================================================
 def uf_to_macroregion(uf: pd.Series) -> pd.Series:
-    """Map UF (state) code to one of 5 macro-regions."""
+    """Map UF code to one of the five Brazilian macro-regions."""
     uf_num = pd.to_numeric(uf, errors="coerce")
     return pd.cut(
         uf_num,
         bins=[0, 17, 29, 35, 43, 99],
         labels=["North", "Northeast", "Southeast", "South", "Central_West"],
-        right=True
+        right=True,
     ).astype(str)
 
 
-# ============================================================================
-# HELPER: age → age group
-# ============================================================================
 def age_to_group(age: pd.Series) -> pd.Series:
     return pd.cut(
         age,
         bins=[14, 24, 34, 44, 54, 64, 200],
         labels=["15-24", "25-34", "35-44", "45-54", "55-64", "65+"],
-        right=True
+        right=True,
     ).astype(str)
 
 
-# ============================================================================
-# HELPER: education level mapping  (POF NIVEL_INSTRUCAO)
-# ============================================================================
 def pof_education_group(nivel: pd.Series) -> pd.Series:
-    """
-    POF NIVEL_INSTRUCAO codes:
-      1 = sem instrução
-      2 = fundamental incompleto
-      3 = fundamental completo
-      4 = médio incompleto
-      5 = médio completo
-      6 = superior incompleto
-      7 = superior completo
-    """
+    """Map POF NIVEL_INSTRUCAO codes to coarse education groups."""
     nivel_num = pd.to_numeric(nivel, errors="coerce")
     mapping = {
         1: "no_education",
@@ -161,20 +158,8 @@ def pof_education_group(nivel: pd.Series) -> pd.Series:
     return nivel_num.map(mapping).fillna("unknown")
 
 
-# ============================================================================
-# HELPER: PNADC education mapping  (VD3004)
-# ============================================================================
 def pnadc_education_group(vd3004: pd.Series) -> pd.Series:
-    """
-    PNADC VD3004 (nível de instrução):
-      1 = sem instrução e menos de 1 ano de estudo
-      2 = fundamental incompleto
-      3 = fundamental completo
-      4 = médio incompleto
-      5 = médio completo
-      6 = superior incompleto
-      7 = superior completo
-    """
+    """Map PNADC VD3004 codes to coarse education groups."""
     vd = pd.to_numeric(vd3004, errors="coerce")
     mapping = {
         1: "no_education",
@@ -188,739 +173,1195 @@ def pnadc_education_group(vd3004: pd.Series) -> pd.Series:
     return vd.map(mapping).fillna("unknown")
 
 
-# ============================================================================
-# HELPER: labour-status classifier (POF)
-# ============================================================================
-def pof_labor_status(row):
-    """
-    Derive labour status from POF data.
-    Uses V0412 (position in occupation) + V0410 (work last week) + age.
-    If total_labor_income > 0:
-        V5303==1 and (V5302==1 or V5304==1) → formal
-        V5303==2 → self-employed
-        else → informal
-    Else if age 15-64 → unemployed
-    Else → inactive
-    """
+def pof_labor_status(row: pd.Series) -> str:
+    """Derive labour status from POF income and occupation flags."""
     if row["total_labor_income"] > 0:
         v5303 = row.get("V5303", np.nan)
         v5302 = row.get("V5302", np.nan)
         if v5303 == 2:
             return "self_employed"
-        elif v5302 == 1:
+        if v5302 == 1:
             return "formal"
-        else:
-            return "informal"
-    elif 15 <= row["age"] < 65:
-        return "unemployed"
-    else:
-        return "inactive"
-
-
-# ============================================================================
-# HELPER: labour-status classifier (PNADC)
-# ============================================================================
-def pnadc_labor_status(row):
-    """
-    PNADC derived columns from datazoom.social:
-      formal   = 1 → formal
-      informal = 1 → informal
-      conta_propria = 1 → self_employed
-      desocupado = 1 → unemployed
-      fora_forca_trab = 1 → inactive
-    """
-    if row.get("formal", 0) == 1:
-        return "formal"
-    elif row.get("conta_propria", 0) == 1:
-        return "self_employed"
-    elif row.get("informal", 0) == 1 or row.get("ocupado", 0) == 1:
         return "informal"
-    elif row.get("desocupado", 0) == 1:
+    if 15 <= row["age"] < 65:
         return "unemployed"
-    else:
-        return "inactive"
+    return "inactive"
 
 
-###############################################################################
-#                          STEP 1 – POF CLASSIFICATION
-###############################################################################
-print("=" * 72)
-print("STEP 1: LOAD & CLASSIFY POF HOUSEHOLDS")
-print("=" * 72)
-
-# ── 1a. Load POF tables ────────────────────────────────────────────────────
-
-# Household (domicílio) – survey weight + state code
-df_dom = read_pof_table("DOMICILIO.txt", "Domicílio")
-for c in ["COD_UPA", "NUM_DOM", "UF", "PESO_FINAL"]:
-    df_dom[c] = pd.to_numeric(df_dom[c], errors="coerce")
-df_dom = df_dom[["COD_UPA", "NUM_DOM", "UF", "PESO_FINAL"]].copy()
-
-# Morador (person demographics)
-df_mor = read_pof_table("MORADOR.txt", "Morador")
-for c in ["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE",
-           "V0403", "V0404", "NIVEL_INSTRUCAO", "RENDA_TOTAL"]:
-    df_mor[c] = pd.to_numeric(df_mor[c], errors="coerce")
-df_mor.rename(columns={"V0403": "age", "V0404": "sex"}, inplace=True)
-df_mor = df_mor[["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE",
-                  "age", "sex", "NIVEL_INSTRUCAO", "RENDA_TOTAL"]].copy()
-
-# Labour income (rendimento do trabalho)
-df_inc = read_pof_table("RENDIMENTO_TRABALHO.txt", "Rendimento do Trabalho")
-for c in ["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE",
-           "V8500_DEFLA", "V5302", "V5303"]:
-    df_inc[c] = pd.to_numeric(df_inc[c], errors="coerce")
-
-# Aggregate labour income to person level & keep occupation flags from first record
-df_inc_agg = (
-    df_inc
-    .groupby(["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE"], as_index=False)
-    .agg(
-        total_labor_income=("V8500_DEFLA", "sum"),
-        V5302=("V5302", "first"),
-        V5303=("V5303", "first"),
-    )
-)
-
-# Other income / transfers  (outros rendimentos)
-df_oth = read_pof_table("OUTROS_RENDIMENTOS.txt", "Outros Rendimentos")
-for c in ["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE",
-           "QUADRO", "V9001", "V8500_DEFLA"]:
-    df_oth[c] = pd.to_numeric(df_oth[c], errors="coerce")
-
-# Categorise transfers by QUADRO
-df_transfers = (
-    df_oth
-    .groupby(["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE"], as_index=False)
-    .apply(lambda g: pd.Series({
-        "pension_income":    g.loc[g.QUADRO == 55, "V8500_DEFLA"].sum(),
-        "govt_transfers":    g.loc[g.QUADRO == 56, "V8500_DEFLA"].sum(),
-        "financial_income":  g.loc[g.QUADRO == 57, "V8500_DEFLA"].sum(),
-        "other_labor_inc":   g.loc[g.QUADRO == 54, "V8500_DEFLA"].sum(),
-        "total_transfers":   g["V8500_DEFLA"].sum(),
-    }))
-)
-
-# Real estate proxy (aluguel estimado)
-df_alug = read_pof_table("ALUGUEL_ESTIMADO.txt", "Aluguel Estimado")
-for c in ["COD_UPA", "NUM_DOM", "NUM_UC", "V8000_DEFLA"]:
-    df_alug[c] = pd.to_numeric(df_alug[c], errors="coerce")
-df_alug = df_alug.groupby(["COD_UPA", "NUM_DOM", "NUM_UC"], as_index=False).agg(
-    estimated_rent=("V8000_DEFLA", "sum")
-)
-df_alug["real_estate_annual"] = df_alug["estimated_rent"] * 12
-
-# ── 1b. Merge all POF tables ──────────────────────────────────────────────
-
-print("\n  Merging POF tables …")
-pof = (
-    df_mor
-    .merge(df_dom, on=["COD_UPA", "NUM_DOM"], how="left")
-    .merge(df_inc_agg, on=["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE"], how="left")
-    .merge(df_transfers, on=["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE"], how="left")
-    .merge(df_alug, on=["COD_UPA", "NUM_DOM", "NUM_UC"], how="left")
-)
-
-# Fill NAs with 0 for financial variables
-fill_cols = ["total_labor_income", "V5302", "V5303",
-             "pension_income", "govt_transfers", "financial_income",
-             "other_labor_inc", "total_transfers",
-             "estimated_rent", "real_estate_annual"]
-pof[fill_cols] = pof[fill_cols].fillna(0)
-
-# Keep only people aged 15+
-pof = pof[pof["age"] >= 15].copy()
-
-print(f"  POF persons (age ≥ 15): {len(pof):,}")
-
-# ── 1c. Compute asset proxies & classify ──────────────────────────────────
-#
-# AUGMENTED LIQUID ASSET IMPUTATION
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Only 8% of POF individuals report financial income (QUADRO 57).
-# Imputing liquid assets purely from financial_income / SELIC assigns
-# liquid_assets = 0 to 92% of the sample → they all become HtM
-# regardless of threshold tuning.
-#
-# Following KVW (2014) augmented approach for countries without
-# direct wealth surveys, we add two proxies:
-#
-#   liquid_assets = financial_component
-#                 + pension_buffer
-#                 + savings_proxy
-#
-#   (a) financial_component = (financial_income × 12) / SELIC
-#   (b) pension_buffer      = pension_income × PENSION_MULT
-#       Pensioners typically hold a few months' pension in
-#       a bank account as a liquidity buffer.
-#   (c) savings_proxy       = max(0, RENDA_TOTAL − monthly_income×12)
-#                             × SAVINGS_FRAC
-#       RENDA_TOTAL (from MORADOR) includes non-monetary income.
-#       The surplus above observed cash flow proxies for implicit
-#       savings capacity. Bolsa Família recipients (QUADRO 56 > 0)
-#       have their savings_proxy zeroed out.
-#
-# Calibrated via grid search to match Brazil HTM literature
-# (Carvalho & Zilberman 2022, De Souza 2023):
-#   Target ≈ PH2M 25%, WH2M 15%, Ricardian 60%
-# ─────────────────────────────────────────────────────────────────────
-
-# Monthly income
-pof["monthly_income"] = pof["total_labor_income"] + pof["total_transfers"]
-pof["monthly_income"] = pof["monthly_income"].clip(lower=1)
-
-# (a) Financial component
-pof["financial_income_annual"] = pof["financial_income"] * 12
-pof["fin_liquid"] = pof["financial_income_annual"] / SELIC_RATE
-
-# (b) Pension buffer
-pof["pen_liquid"] = pof["pension_income"] * PENSION_MULT
-
-# (c) Savings proxy from income surplus
-pof["income_surplus"] = (pof["RENDA_TOTAL"] - pof["monthly_income"] * 12).clip(lower=0)
-pof["sav_liquid"] = pof["income_surplus"] * SAVINGS_FRAC
-# Zero out for Bolsa Família recipients
-pof.loc[pof["govt_transfers"] > 0, "sav_liquid"] = 0
-
-# Total liquid assets
-pof["liquid_assets"] = pof["fin_liquid"] + pof["pen_liquid"] + pof["sav_liquid"]
-
-# Illiquid assets = annualised real-estate proxy
-pof["illiquid_assets"] = pof["real_estate_annual"]
-
-# Per-capita income via household size
-hh_size = (
-    pof.groupby(["COD_UPA", "NUM_DOM", "NUM_UC"])["age"]
-    .transform("count")
-)
-pof["pc_income"] = pof["monthly_income"] / hh_size
-
-# Ratios
-pof["liquid_ratio"]   = pof["liquid_assets"]   / pof["monthly_income"]
-pof["illiquid_ratio"]  = pof["illiquid_assets"]  / pof["monthly_income"]
-
-# Poverty flag (kept for diagnostics, not used as classification gate)
-pof["is_poor"] = pof["pc_income"] <= POVERTY_LINE
-
-# ── Kaplan-Violante-Weidner classification (refined) ───────────────────
-#
-# The original KVW logic has two dimensions:
-#   (a) liquid-asset-poor:  liquid_ratio ≤ 0.25  (≈ ½ pay-cheque)
-#   (b) illiquid-asset-rich: illiquid_ratio ≥ 6   (≥ 6 months income)
-#
-# Four quadrants:
-#   liquid-poor  & illiquid-poor  → PH2M  (poor hand-to-mouth)
-#   liquid-poor  & illiquid-rich  → WH2M  (wealthy hand-to-mouth)
-#   liquid-rich  & anything       → Ricardian
-#
-# The original code also required is_poor for PH2M and NOT is_poor for
-# WH2M, which left a large gap: non-poor people with low liquid AND low
-# illiquid fell to Ricardian despite having no buffer.
-#
-# Refined rule:
-#   1. liquid_ratio > LIQUID_THRESH                          → Ricardian
-#   2. liquid_ratio ≤ LIQUID_THRESH & illiquid ≥ ILLIQUID    → WH2M
-#   3. liquid_ratio ≤ LIQUID_THRESH & illiquid < ILLIQUID    → PH2M
-#
-# This is the standard two-threshold KVW classification (Kaplan,
-# Violante & Weidner 2014, Table 1). The poverty line is no longer
-# a gate but is kept as an auxiliary variable for diagnostics.
-# ───────────────────────────────────────────────────────────────────────
-
-def classify_agent(row):
-    lr = row["liquid_ratio"]
-    ir = row["illiquid_ratio"]
-    # Has meaningful liquid buffer → Ricardian (can smooth consumption)
-    if lr > LIQUID_THRESH:
+def classify_agent(row: pd.Series) -> str:
+    """Kaplan-Violante-Weidner two-threshold classification."""
+    if row["liquid_ratio"] > LIQUID_THRESH:
         return "Ricardian"
-    # Liquid-constrained but asset-rich → Wealthy HtM
-    if ir >= ILLIQUID_MULT:
+    if row["illiquid_ratio"] >= ILLIQUID_MULT:
         return "WH2M"
-    # Liquid-constrained and asset-poor → Poor HtM
     return "PH2M"
 
-pof["agent_type"] = pof.apply(classify_agent, axis=1)
 
-# National weighted shares (POF)
-w = pof["PESO_FINAL"]
-total_w = w.sum()
-pof_national = {
-    t: w[pof["agent_type"] == t].sum() / total_w
-    for t in ["PH2M", "WH2M", "Ricardian"]
-}
+def build_pof_bin_shares(
+    tables_dir: Path = TABLES_DIR,
+) -> tuple[pd.DataFrame, np.ndarray, dict[str, float]]:
+    """
+    Classify POF records and compute smoothed demographic bin probabilities.
 
-print("\n  ┌─────────────────────────────────────────────────────────┐")
-print("  │  POF National Weighted Type Shares (Step 1)            │")
-print("  ├──────────────┬──────────────┬──────────────┬───────────┤")
-print(f"  │  PH2M        │  WH2M        │  Ricardian   │  N obs    │")
-print(f"  │  {pof_national['PH2M']:.4f}      │  {pof_national['WH2M']:.4f}      │  {pof_national['Ricardian']:.4f}    │  {len(pof):>7,} │")
-print("  └──────────────┴──────────────┴──────────────┴───────────┘")
+    Returns:
+        bin_shares: one row per bin_key with p_ph2m, p_wh2m, p_ric.
+        pof_quintile_edges: POF per-capita income quintile cut-points.
+        pof_national: national weighted probabilities for fallback matching.
+    """
+    print("=" * 72)
+    print("STEP 1: LOAD & CLASSIFY POF HOUSEHOLDS")
+    print("=" * 72)
 
+    df_dom = read_pof_table("DOMICILIO.txt", "Domicílio")
+    for col in ["COD_UPA", "NUM_DOM", "UF", "PESO_FINAL"]:
+        df_dom[col] = pd.to_numeric(df_dom[col], errors="coerce")
+    df_dom = df_dom[["COD_UPA", "NUM_DOM", "UF", "PESO_FINAL"]].copy()
 
-###############################################################################
-#               STEP 2 – POF DEMOGRAPHIC BINS & WEIGHTED SHARES
-###############################################################################
-print("\n" + "=" * 72)
-print("STEP 2: BUILD POF DEMOGRAPHIC BINS & WEIGHTED TYPE SHARES")
-print("=" * 72)
+    df_mor = read_pof_table("MORADOR.txt", "Morador")
+    for col in [
+        "COD_UPA",
+        "NUM_DOM",
+        "NUM_UC",
+        "COD_INFORMANTE",
+        "V0403",
+        "V0404",
+        "NIVEL_INSTRUCAO",
+        "RENDA_TOTAL",
+    ]:
+        df_mor[col] = pd.to_numeric(df_mor[col], errors="coerce")
+    df_mor.rename(columns={"V0403": "age", "V0404": "sex"}, inplace=True)
+    df_mor = df_mor[
+        [
+            "COD_UPA",
+            "NUM_DOM",
+            "NUM_UC",
+            "COD_INFORMANTE",
+            "age",
+            "sex",
+            "NIVEL_INSTRUCAO",
+            "RENDA_TOTAL",
+        ]
+    ].copy()
 
-# Bin variables
-pof["macro_region"]    = uf_to_macroregion(pof["UF"])
-pof["age_group"]       = age_to_group(pof["age"])
-pof["gender"]          = pof["sex"].map({1: "male", 2: "female"}).fillna("unknown")
-pof["education_group"] = pof_education_group(pof["NIVEL_INSTRUCAO"])
-
-# Labour status
-pof["labor_status"] = pof.apply(pof_labor_status, axis=1)
-
-# Per-capita income quintile (weighted); save cut-points for PNADC alignment
-pof["pc_income_quintile"], pof_quintile_edges = pd.qcut(
-    pof["pc_income"], q=5, labels=["Q1", "Q2", "Q3", "Q4", "Q5"], retbins=True
-)
-pof["pc_income_quintile"] = pof["pc_income_quintile"].astype(str)
-
-# Composite bin key
-pof["bin_key"] = (
-    pof["macro_region"] + "|" +
-    pof["age_group"] + "|" +
-    pof["gender"] + "|" +
-    pof["education_group"] + "|" +
-    pof["pc_income_quintile"] + "|" +
-    pof["labor_status"]
-)
-
-# ── Weighted shares per bin with Dirichlet smoothing ──────────────────────
-
-def compute_bin_shares(group):
-    w = group["PESO_FINAL"]
-    total = w.sum()
-    n_ph2m = w[group["agent_type"] == "PH2M"].sum()
-    n_wh2m = w[group["agent_type"] == "WH2M"].sum()
-    n_ric  = w[group["agent_type"] == "Ricardian"].sum()
-
-    # Dirichlet smoothing: add alpha to each count
-    a = ALPHA_SMOOTH
-    denom = total + 3 * a
-    p_ph2m = (n_ph2m + a) / denom
-    p_wh2m = (n_wh2m + a) / denom
-    p_ric  = (n_ric  + a) / denom
-
-    return pd.Series({
-        "p_ph2m":        p_ph2m,
-        "p_wh2m":        p_wh2m,
-        "p_ric":         p_ric,
-        "weighted_n":    total,
-        "raw_n":         len(group),
-        "small_bin_flag": int(total < MIN_WEIGHTED_N),
-    })
-
-bin_shares = pof.groupby("bin_key", as_index=False).apply(compute_bin_shares)
-
-# Save
-TABLES_DIR.mkdir(parents=True, exist_ok=True)
-PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-out_path_bins = TABLES_DIR / "pof_bin_shares.csv"
-bin_shares.to_csv(out_path_bins, index=False)
-print(f"\n  Saved {len(bin_shares):,} bins → {out_path_bins}")
-print(f"  Bins with < {MIN_WEIGHTED_N} weighted obs (flagged): "
-      f"{bin_shares['small_bin_flag'].sum():,}")
-
-
-###############################################################################
-#        STEP 3 – PNADC: BUILD BIN KEY & MERGE TYPE SHARES
-###############################################################################
-print("\n" + "=" * 72)
-print("STEP 3: LOAD PNADC & MERGE TYPE SHARES")
-print("=" * 72)
-
-pnad_path = args.pnad_parquet if args.pnad_parquet is not None else PNAD_MATCHED_DEFAULT
-if not pnad_path.exists():
-    raise FileNotFoundError(
-        f"PNADC Parquet not found: {pnad_path} — add the file or pass --pnad-parquet PATH"
+    df_inc = read_pof_table("RENDIMENTO_TRABALHO.txt", "Rendimento do Trabalho")
+    for col in [
+        "COD_UPA",
+        "NUM_DOM",
+        "NUM_UC",
+        "COD_INFORMANTE",
+        "V8500_DEFLA",
+        "V5302",
+        "V5303",
+    ]:
+        df_inc[col] = pd.to_numeric(df_inc[col], errors="coerce")
+    df_inc_agg = (
+        df_inc.groupby(["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE"], as_index=False)
+        .agg(
+            total_labor_income=("V8500_DEFLA", "sum"),
+            V5302=("V5302", "first"),
+            V5303=("V5303", "first"),
+        )
     )
-print(f"  Loading {pnad_path} …")
-pnadc = pd.read_parquet(pnad_path)
-pnadc["year"] = pd.to_numeric(pnadc["Ano"], errors="coerce")
-pnadc["quarter"] = pd.to_numeric(pnadc["Trimestre"], errors="coerce")
-print(f"  Total PNADC records: {len(pnadc):,}")
 
-# Detect datazoom test format (faixa_idade, no V2009) vs raw panel (V2009, VD3004)
-use_test_format = "faixa_idade" in pnadc.columns and "V2009" not in pnadc.columns
-
-# Key columns
-pnadc["uf_code"] = pd.to_numeric(pnadc["UF"], errors="coerce")
-if use_test_format:
-    pnadc["age"] = faixa_idade_to_age(pnadc["faixa_idade"])
-    pnadc["sex_code"] = pnadc["sexo"].map({"Homem": 1, "Mulher": 2})
-    pnadc["vd3004"] = faixa_educ_to_vd3004(pnadc["faixa_educ"])
-    pnadc["weight"] = pd.to_numeric(pnadc["Habitual"], errors="coerce")
-    pnadc["rendimento"] = pd.to_numeric(pnadc["rendimento_habitual_real"], errors="coerce").fillna(0)
-    pnadc["hh_size"] = pnadc.groupby(["Ano", "Trimestre", "ID_DOMICILIO"])["Ano"].transform("count")
-    pnadc["hh_size"] = pnadc["hh_size"].clip(lower=1)
-else:
-    pnadc["age"] = pd.to_numeric(pnadc["V2009"], errors="coerce")
-    pnadc["sex_code"] = pd.to_numeric(pnadc["V2007"], errors="coerce")
-    pnadc["vd3004"] = pd.to_numeric(pnadc["VD3004"], errors="coerce")
-    pnadc["weight"] = pd.to_numeric(pnadc["V1028"], errors="coerce")
-    pnadc["rendimento"] = pd.to_numeric(pnadc.get("rendimento_habitual_real", np.nan), errors="coerce").fillna(0)
-    pnadc["hh_size"] = pd.to_numeric(pnadc["V2001"], errors="coerce").clip(lower=1)
-pnadc["pc_income_pnadc"] = pnadc["rendimento"] / pnadc["hh_size"]
-
-# Keep age ≥ 15
-pnadc = pnadc[pnadc["age"] >= 15].copy()
-print(f"  PNADC persons (age ≥ 15): {len(pnadc):,}")
-
-# ── Build identical bin variables ──────────────────────────────────────────
-
-pnadc["macro_region"]    = uf_to_macroregion(pnadc["uf_code"])
-pnadc["age_group"]       = age_to_group(pnadc["age"])
-pnadc["gender"]          = pnadc["sex_code"].map({1: "male", 2: "female"}).fillna("unknown")
-pnadc["education_group"] = pnadc_education_group(pnadc["vd3004"])
-
-# Labour status
-for col in ["formal", "informal", "ocupado", "desocupado",
-            "conta_propria", "fora_forca_trab"]:
-    if col in pnadc.columns:
-        pnadc[col] = pd.to_numeric(pnadc[col], errors="coerce").fillna(0)
-pnadc["labor_status"] = pnadc.apply(pnadc_labor_status, axis=1)
-
-# Income quintile: POF cut-points (default) or per-quarter quintiles
-if args.per_quarter_quintiles:
-    pnadc["pc_income_quintile"] = (
-        pnadc.groupby(["year", "quarter"])["pc_income_pnadc"]
-        .transform(
-            lambda x: pd.qcut(
-                x.rank(method="first"),
-                q=5,
-                labels=["Q1", "Q2", "Q3", "Q4", "Q5"],
+    df_oth = read_pof_table("OUTROS_RENDIMENTOS.txt", "Outros Rendimentos")
+    for col in [
+        "COD_UPA",
+        "NUM_DOM",
+        "NUM_UC",
+        "COD_INFORMANTE",
+        "QUADRO",
+        "V9001",
+        "V8500_DEFLA",
+    ]:
+        df_oth[col] = pd.to_numeric(df_oth[col], errors="coerce")
+    df_transfers = (
+        df_oth.groupby(["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE"], as_index=False)
+        .apply(
+            lambda g: pd.Series(
+                {
+                    "pension_income": g.loc[g.QUADRO == 55, "V8500_DEFLA"].sum(),
+                    "govt_transfers": g.loc[g.QUADRO == 56, "V8500_DEFLA"].sum(),
+                    "financial_income": g.loc[g.QUADRO == 57, "V8500_DEFLA"].sum(),
+                    "other_labor_inc": g.loc[g.QUADRO == 54, "V8500_DEFLA"].sum(),
+                    "total_transfers": g["V8500_DEFLA"].sum(),
+                }
             )
         )
-        .astype(str)
-        .fillna("Q3")
     )
-else:
-    bins_extended = np.concatenate([[-np.inf], pof_quintile_edges[1:-1], [np.inf]])
-    pnadc["pc_income_quintile"] = (
-        pd.cut(
-            pnadc["pc_income_pnadc"],
-            bins=bins_extended,
-            labels=["Q1", "Q2", "Q3", "Q4", "Q5"],
-            include_lowest=True,
+
+    df_alug = read_pof_table("ALUGUEL_ESTIMADO.txt", "Aluguel Estimado")
+    for col in ["COD_UPA", "NUM_DOM", "NUM_UC", "V8000_DEFLA"]:
+        df_alug[col] = pd.to_numeric(df_alug[col], errors="coerce")
+    df_alug = df_alug.groupby(["COD_UPA", "NUM_DOM", "NUM_UC"], as_index=False).agg(
+        estimated_rent=("V8000_DEFLA", "sum")
+    )
+    df_alug["real_estate_annual"] = df_alug["estimated_rent"] * 12
+
+    print("\n  Merging POF tables ...")
+    pof = (
+        df_mor.merge(df_dom, on=["COD_UPA", "NUM_DOM"], how="left")
+        .merge(df_inc_agg, on=["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE"], how="left")
+        .merge(df_transfers, on=["COD_UPA", "NUM_DOM", "NUM_UC", "COD_INFORMANTE"], how="left")
+        .merge(df_alug, on=["COD_UPA", "NUM_DOM", "NUM_UC"], how="left")
+    )
+
+    fill_cols = [
+        "total_labor_income",
+        "V5302",
+        "V5303",
+        "pension_income",
+        "govt_transfers",
+        "financial_income",
+        "other_labor_inc",
+        "total_transfers",
+        "estimated_rent",
+        "real_estate_annual",
+    ]
+    pof[fill_cols] = pof[fill_cols].fillna(0)
+    pof = pof[pof["age"] >= 15].copy()
+    print(f"  POF persons (age >= 15): {len(pof):,}")
+
+    pof["monthly_income"] = pof["total_labor_income"] + pof["total_transfers"]
+    pof["monthly_income"] = pof["monthly_income"].clip(lower=1)
+    pof["financial_income_annual"] = pof["financial_income"] * 12
+    pof["fin_liquid"] = pof["financial_income_annual"] / SELIC_RATE
+    pof["pen_liquid"] = pof["pension_income"] * PENSION_MULT
+    pof["income_surplus"] = (pof["RENDA_TOTAL"] - pof["monthly_income"] * 12).clip(lower=0)
+    pof["sav_liquid"] = pof["income_surplus"] * SAVINGS_FRAC
+    pof.loc[pof["govt_transfers"] > 0, "sav_liquid"] = 0
+    pof["liquid_assets"] = pof["fin_liquid"] + pof["pen_liquid"] + pof["sav_liquid"]
+    pof["illiquid_assets"] = pof["real_estate_annual"]
+
+    hh_size = pof.groupby(["COD_UPA", "NUM_DOM", "NUM_UC"])["age"].transform("count")
+    pof["pc_income"] = pof["monthly_income"] / hh_size
+    pof["liquid_ratio"] = pof["liquid_assets"] / pof["monthly_income"]
+    pof["illiquid_ratio"] = pof["illiquid_assets"] / pof["monthly_income"]
+    pof["is_poor"] = pof["pc_income"] <= POVERTY_LINE
+    pof["agent_type"] = pof.apply(classify_agent, axis=1)
+
+    weights = pof["PESO_FINAL"]
+    total_w = weights.sum()
+    pof_national_agent = {
+        agent_type: weights[pof["agent_type"] == agent_type].sum() / total_w
+        for agent_type in AGENT_TYPES
+    }
+    pof_national = {
+        "p_ph2m": pof_national_agent["PH2M"],
+        "p_wh2m": pof_national_agent["WH2M"],
+        "p_ric": pof_national_agent["Ricardian"],
+    }
+
+    print("\n  POF national weighted type shares")
+    print(
+        f"    PH2M={pof_national_agent['PH2M']:.4f}  "
+        f"WH2M={pof_national_agent['WH2M']:.4f}  "
+        f"Ricardian={pof_national_agent['Ricardian']:.4f}  "
+        f"N={len(pof):,}"
+    )
+
+    print("\n" + "=" * 72)
+    print("STEP 2: BUILD POF DEMOGRAPHIC BINS & WEIGHTED TYPE SHARES")
+    print("=" * 72)
+
+    pof["macro_region"] = uf_to_macroregion(pof["UF"])
+    pof["age_group"] = age_to_group(pof["age"])
+    pof["gender"] = pof["sex"].map({1: "male", 2: "female"}).fillna("unknown")
+    pof["education_group"] = pof_education_group(pof["NIVEL_INSTRUCAO"])
+    pof["labor_status"] = pof.apply(pof_labor_status, axis=1)
+    pof["pc_income_quintile"], pof_quintile_edges = pd.qcut(
+        pof["pc_income"], q=5, labels=QUINTILE_LABELS, retbins=True
+    )
+    pof["pc_income_quintile"] = pof["pc_income_quintile"].astype(str)
+    pof["bin_key"] = (
+        pof["macro_region"]
+        + "|"
+        + pof["age_group"]
+        + "|"
+        + pof["gender"]
+        + "|"
+        + pof["education_group"]
+        + "|"
+        + pof["pc_income_quintile"]
+        + "|"
+        + pof["labor_status"]
+    )
+
+    grouped = pof.groupby("bin_key")
+    weighted = pof.pivot_table(
+        index="bin_key",
+        columns="agent_type",
+        values="PESO_FINAL",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    for agent_type in AGENT_TYPES:
+        if agent_type not in weighted.columns:
+            weighted[agent_type] = 0.0
+    total = grouped["PESO_FINAL"].sum()
+    raw_n = grouped.size()
+    denom = total + 3 * ALPHA_SMOOTH
+
+    bin_shares = pd.DataFrame(
+        {
+            "bin_key": total.index,
+            "p_ph2m": (weighted["PH2M"] + ALPHA_SMOOTH) / denom,
+            "p_wh2m": (weighted["WH2M"] + ALPHA_SMOOTH) / denom,
+            "p_ric": (weighted["Ricardian"] + ALPHA_SMOOTH) / denom,
+            "weighted_n": total,
+            "raw_n": raw_n,
+            "small_bin_flag": (total < MIN_WEIGHTED_N).astype(int),
+        }
+    ).reset_index(drop=True)
+    bin_shares.attrs["pof_national"] = pof_national
+
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    out_path_bins = tables_dir / "pof_bin_shares.csv"
+    bin_shares.to_csv(out_path_bins, index=False)
+    print(f"\n  Saved {len(bin_shares):,} bins -> {out_path_bins}")
+    print(
+        f"  Bins with < {MIN_WEIGHTED_N} weighted obs: "
+        f"{int(bin_shares['small_bin_flag'].sum()):,}"
+    )
+
+    return bin_shares, pof_quintile_edges, pof_national
+
+
+# ============================================================================
+# PNADC batch preparation
+# ============================================================================
+
+
+def _numeric_column(df: pd.DataFrame, col: str, default: float = np.nan) -> pd.Series:
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce")
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def _parse_ref_month_yyyymm(series: pd.Series) -> pd.Series:
+    """Return nullable integer YYYYMM keys from strings, numbers, or datetimes."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        key = series.dt.year * 100 + series.dt.month
+        return key.astype("Int64")
+
+    digits = (
+        series.astype("string")
+        .str.replace(r"\D", "", regex=True)
+        .str.slice(0, 6)
+    )
+    key = pd.to_numeric(digits, errors="coerce")
+    return key.astype("Int64")
+
+
+def _income_quintiles_from_pof_edges(income: pd.Series, pof_quintile_edges: np.ndarray) -> pd.Series:
+    bins_extended = np.concatenate([[-np.inf], np.asarray(pof_quintile_edges)[1:-1], [np.inf]])
+    q = pd.cut(
+        income,
+        bins=bins_extended,
+        labels=QUINTILE_LABELS,
+        include_lowest=True,
+    )
+    return pd.Series(q, index=income.index).astype("object").where(pd.notna(q), "Q3").astype(str)
+
+
+def _per_quarter_quintiles(df: pd.DataFrame) -> pd.Series:
+    """Legacy option: rank within the current batch's year-quarter cells."""
+    out = pd.Series("Q3", index=df.index, dtype="object")
+    quarter = ((df["month"].astype(int) - 1) // 3 + 1).astype(int)
+    tmp = df.assign(_quarter=quarter)
+
+    def assign_group(group: pd.DataFrame) -> pd.Series:
+        if group["pc_income_pnadc"].notna().sum() < 5:
+            return pd.Series("Q3", index=group.index, dtype="object")
+        return pd.qcut(
+            group["pc_income_pnadc"].rank(method="first"),
+            q=5,
+            labels=QUINTILE_LABELS,
+        ).astype("object")
+
+    for _, group in tmp.groupby(["year", "_quarter"], dropna=False):
+        out.loc[group.index] = assign_group(group)
+    return out.astype(str)
+
+
+def _pnadc_labor_status_vectorized(df: pd.DataFrame) -> pd.Series:
+    formal = _numeric_column(df, "formal", 0).fillna(0)
+    conta_propria = _numeric_column(df, "conta_propria", 0).fillna(0)
+    informal = _numeric_column(df, "informal", 0).fillna(0)
+    ocupado = _numeric_column(df, "ocupado", 0).fillna(0)
+    desocupado = _numeric_column(df, "desocupado", 0).fillna(0)
+
+    status = pd.Series("inactive", index=df.index, dtype="object")
+    status.loc[desocupado == 1] = "unemployed"
+    status.loc[(informal == 1) | (ocupado == 1)] = "informal"
+    status.loc[conta_propria == 1] = "self_employed"
+    status.loc[formal == 1] = "formal"
+    return status
+
+
+def _fallback_probabilities(bin_shares: pd.DataFrame) -> dict[str, float]:
+    attrs = bin_shares.attrs.get("pof_national")
+    if attrs is not None:
+        return {
+            "p_ph2m": float(attrs["p_ph2m"]),
+            "p_wh2m": float(attrs["p_wh2m"]),
+            "p_ric": float(attrs["p_ric"]),
+        }
+
+    if "weighted_n" in bin_shares.columns:
+        weights = pd.to_numeric(bin_shares["weighted_n"], errors="coerce").fillna(0)
+        if weights.sum() > 0:
+            return {
+                "p_ph2m": float(np.average(bin_shares["p_ph2m"], weights=weights)),
+                "p_wh2m": float(np.average(bin_shares["p_wh2m"], weights=weights)),
+                "p_ric": float(np.average(bin_shares["p_ric"], weights=weights)),
+            }
+
+    return {
+        "p_ph2m": float(bin_shares["p_ph2m"].mean()),
+        "p_wh2m": float(bin_shares["p_wh2m"].mean()),
+        "p_ric": float(bin_shares["p_ric"].mean()),
+    }
+
+
+def deterministic_uniform(ids: pd.Series, random_seed: int = RANDOM_SEED) -> np.ndarray:
+    """Stable per-id U(0, 1) draw independent of batch order."""
+    payload = ids.astype("string").fillna("") + f"|{random_seed}"
+    hashed = pd.util.hash_pandas_object(payload, index=False).to_numpy(dtype=np.uint64)
+    return hashed.astype("float64") / float(2**64)
+
+
+def _stable_missing_id_fallback(df: pd.DataFrame) -> pd.Series:
+    """
+    Build a deterministic row key when both panel IDs are missing.
+
+    This is only for the Monte Carlo diagnostic. Expected monthly shares are
+    unaffected by MC labels, and the fallback avoids dropping otherwise valid
+    monthly observations because of incomplete identifier fields.
+    """
+    key_cols = [
+        "UF",
+        "UPA",
+        "V1008",
+        "V1014",
+        "V2003",
+        "V2007",
+        "V2008",
+        "V20081",
+        "V20082",
+        "V2009",
+        "ref_month_yyyymm",
+        "ref_month_in_year",
+    ]
+    available = [col for col in key_cols if col in df.columns]
+    if not available:
+        return pd.Series("fallback-row-" + df.index.astype("string"), index=df.index)
+
+    key = df[available].astype("string").fillna("<NA>").agg("|".join, axis=1)
+    return "fallback-fields|" + key
+
+
+def _deterministic_agent_type(df: pd.DataFrame, random_seed: int) -> pd.Series:
+    if "id_rs" in df.columns:
+        ids = df["id_rs"].copy()
+        if "id_ind" in df.columns:
+            ids = ids.where(ids.notna(), df["id_ind"])
+    elif "id_ind" in df.columns:
+        ids = df["id_ind"].copy()
+    else:
+        raise ValueError("PNADC batch must contain id_rs or id_ind for deterministic MC draws.")
+
+    if ids.isna().any():
+        ids = ids.where(ids.notna(), _stable_missing_id_fallback(df))
+
+    u = deterministic_uniform(ids, random_seed=random_seed)
+    return pd.Series(
+        np.where(
+            u <= df["p_ph2m"].to_numpy(),
+            "PH2M",
+            np.where(
+                u <= (df["p_ph2m"] + df["p_wh2m"]).to_numpy(),
+                "WH2M",
+                "Ricardian",
+            ),
+        ),
+        index=df.index,
+        dtype="object",
+    )
+
+
+def _exclusions_by_month(ref_key: pd.Series, weight_missing: pd.Series) -> pd.DataFrame:
+    frame = pd.DataFrame(
+        {
+            "ref_month_yyyymm": ref_key,
+            "excluded_missing_weight": weight_missing.astype(int),
+            "raw_rows_with_known_month": ref_key.notna().astype(int),
+        }
+    )
+    frame = frame[frame["ref_month_yyyymm"].notna()].copy()
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "ref_month_yyyymm",
+                "year",
+                "month",
+                "excluded_missing_weight",
+                "raw_rows_with_known_month",
+            ]
         )
-        .astype(str)
-        .fillna("Q3")  # fallback for NaN income
+
+    out = (
+        frame.groupby("ref_month_yyyymm", as_index=False)
+        .agg(
+            excluded_missing_weight=("excluded_missing_weight", "sum"),
+            raw_rows_with_known_month=("raw_rows_with_known_month", "sum"),
+        )
+    )
+    key_num = out["ref_month_yyyymm"].astype("int64")
+    out["year"] = (key_num // 100).astype(int)
+    out["month"] = (key_num % 100).astype(int)
+    return out
+
+
+def prepare_pnadc_batch(
+    batch_df: pd.DataFrame,
+    bin_shares: pd.DataFrame,
+    pof_quintile_edges: np.ndarray,
+    *,
+    per_quarter_quintiles: bool = False,
+    random_seed: int = RANDOM_SEED,
+) -> pd.DataFrame:
+    """
+    Prepare one PNADC parquet batch for monthly aggregation.
+
+    The returned DataFrame contains only age-eligible rows with non-missing
+    monthly keys, non-missing monthly weights, and non-missing UF codes.
+    Exclusion and match diagnostics are stored in returned.attrs["diagnostics"].
+    """
+    df = batch_df.copy()
+    raw_n = len(df)
+
+    ref_key = _parse_ref_month_yyyymm(df["ref_month_yyyymm"])
+    month_in_year = pd.to_numeric(df["ref_month_in_year"], errors="coerce")
+    weight_monthly = pd.to_numeric(df["weight_monthly"], errors="coerce")
+    age = pd.to_numeric(df["V2009"], errors="coerce")
+    uf_code = pd.to_numeric(df["UF"], errors="coerce")
+
+    missing_ref = ref_key.isna()
+    missing_weight = weight_monthly.isna()
+    age_eligible = age >= 15
+    missing_uf = uf_code.isna()
+
+    keep = age_eligible & ~missing_ref & ~missing_weight & ~missing_uf
+    diagnostics: dict[str, Any] = {
+        "n_raw": int(raw_n),
+        "n_missing_ref_month": int(missing_ref.sum()),
+        "n_missing_weight_monthly": int(missing_weight.sum()),
+        "n_excluded_monthly": int((missing_ref | missing_weight).sum()),
+        "n_under_15_or_missing_age": int((~age_eligible).sum()),
+        "n_missing_uf": int(missing_uf.sum()),
+        "excluded_by_month": _exclusions_by_month(ref_key, missing_weight),
+    }
+
+    df = df.loc[keep].copy()
+    if df.empty:
+        diagnostics["n_included"] = 0
+        diagnostics["n_unmatched"] = 0
+        df.attrs["diagnostics"] = diagnostics
+        return df
+
+    ref_kept = ref_key.loc[keep].astype("int64")
+    month_from_key = (ref_kept % 100).astype(int)
+    month_kept = month_in_year.loc[keep].where(month_in_year.loc[keep].between(1, 12), month_from_key)
+
+    df["ref_month_yyyymm"] = ref_kept.astype(int)
+    df["year"] = (ref_kept // 100).astype(int)
+    df["month"] = month_kept.astype(int)
+    df["uf_code"] = uf_code.loc[keep].astype(int)
+    df["age"] = age.loc[keep].astype(float)
+    df["sex_code"] = pd.to_numeric(df["V2007"], errors="coerce")
+    df["vd3004"] = pd.to_numeric(df["VD3004"], errors="coerce")
+    df["weight_monthly"] = weight_monthly.loc[keep].astype(float)
+
+    hh_size = pd.to_numeric(df["V2001"], errors="coerce").clip(lower=1).fillna(1)
+    rendimento = pd.to_numeric(df["rendimento_habitual_real"], errors="coerce").fillna(0)
+    df["pc_income_pnadc"] = rendimento / hh_size
+
+    df["macro_region"] = uf_to_macroregion(df["uf_code"])
+    df["age_group"] = age_to_group(df["age"])
+    df["gender"] = df["sex_code"].map({1: "male", 2: "female"}).fillna("unknown")
+    df["education_group"] = pnadc_education_group(df["vd3004"])
+    df["labor_status"] = _pnadc_labor_status_vectorized(df)
+
+    if per_quarter_quintiles:
+        df["pc_income_quintile"] = _per_quarter_quintiles(df)
+    else:
+        df["pc_income_quintile"] = _income_quintiles_from_pof_edges(
+            df["pc_income_pnadc"], pof_quintile_edges
+        )
+
+    df["bin_key"] = (
+        df["macro_region"]
+        + "|"
+        + df["age_group"]
+        + "|"
+        + df["gender"]
+        + "|"
+        + df["education_group"]
+        + "|"
+        + df["pc_income_quintile"]
+        + "|"
+        + df["labor_status"]
     )
 
-# Bin key
-pnadc["bin_key"] = (
-    pnadc["macro_region"] + "|" +
-    pnadc["age_group"] + "|" +
-    pnadc["gender"] + "|" +
-    pnadc["education_group"] + "|" +
-    pnadc["pc_income_quintile"] + "|" +
-    pnadc["labor_status"]
-)
+    merge_cols = ["bin_key", "p_ph2m", "p_wh2m", "p_ric"]
+    df = df.merge(bin_shares[merge_cols].drop_duplicates("bin_key"), on="bin_key", how="left")
+    df["_unmatched_bin"] = df["p_ph2m"].isna()
 
-# ── Left-merge ─────────────────────────────────────────────────────────────
+    fallback = _fallback_probabilities(bin_shares)
+    df["p_ph2m"] = df["p_ph2m"].fillna(fallback["p_ph2m"])
+    df["p_wh2m"] = df["p_wh2m"].fillna(fallback["p_wh2m"])
+    df["p_ric"] = df["p_ric"].fillna(fallback["p_ric"])
 
-pnadc = pnadc.merge(
-    bin_shares[["bin_key", "p_ph2m", "p_wh2m", "p_ric"]],
-    on="bin_key", how="left"
-)
+    prob_sum = df["p_ph2m"] + df["p_wh2m"] + df["p_ric"]
+    non_unit = prob_sum.notna() & ~np.isclose(prob_sum, 1.0)
+    if non_unit.any():
+        df.loc[non_unit, ["p_ph2m", "p_wh2m", "p_ric"]] = df.loc[
+            non_unit, ["p_ph2m", "p_wh2m", "p_ric"]
+        ].div(prob_sum.loc[non_unit], axis=0)
 
-# National averages from POF for unmatched bins
-nat_avg_ph2m = pof_national["PH2M"]
-nat_avg_wh2m = pof_national["WH2M"]
-nat_avg_ric  = pof_national["Ricardian"]
+    df["agent_type"] = _deterministic_agent_type(df, random_seed=random_seed)
 
-pnadc["_unmatched_bin"] = pnadc["p_ph2m"].isna()
-n_unmatched = pnadc["_unmatched_bin"].sum()
-pnadc["p_ph2m"] = pnadc["p_ph2m"].fillna(nat_avg_ph2m)
-pnadc["p_wh2m"] = pnadc["p_wh2m"].fillna(nat_avg_wh2m)
-pnadc["p_ric"]  = pnadc["p_ric"].fillna(nat_avg_ric)
-
-print(f"\n  Matched bins:   {len(pnadc) - n_unmatched:>9,}")
-print(f"  Unmatched (→ national avg): {n_unmatched:>9,}")
-
-# Post-merge weighted shares
-pw = pnadc["weight"]
-tw = pw.sum()
-merge_shares = {
-    "PH2M":      (pnadc["p_ph2m"] * pw).sum() / tw,
-    "WH2M":      (pnadc["p_wh2m"] * pw).sum() / tw,
-    "Ricardian":  (pnadc["p_ric"]  * pw).sum() / tw,
-}
-print("\n  ┌─────────────────────────────────────────────────────────┐")
-print("  │  PNADC Post-Merge Expected Type Shares (Step 3)        │")
-print("  ├──────────────┬──────────────┬──────────────┬───────────┤")
-print(f"  │  PH2M        │  WH2M        │  Ricardian   │  N obs    │")
-print(f"  │  {merge_shares['PH2M']:.4f}      │  {merge_shares['WH2M']:.4f}      │  {merge_shares['Ricardian']:.4f}    │  {len(pnadc):>7,} │")
-print("  └──────────────┴──────────────┴──────────────┴───────────┘")
-
-# ── Per-quarter diagnostics (for calibration / 2017Q4 investigation) ───────
-print("\n  Per-quarter diagnostics:")
-
-def _quarter_diag(g):
-    return pd.Series({
-        "n_obs": len(g),
-        "n_unmatched": g["_unmatched_bin"].sum(),
-        "mean_pc_income": round(g["pc_income_pnadc"].mean(), 2),
-        "share_Q1": (g["pc_income_quintile"] == "Q1").mean(),
-        "share_Q2": (g["pc_income_quintile"] == "Q2").mean(),
-        "share_Q3": (g["pc_income_quintile"] == "Q3").mean(),
-        "share_Q4": (g["pc_income_quintile"] == "Q4").mean(),
-        "share_Q5": (g["pc_income_quintile"] == "Q5").mean(),
-        "share_formal": (g["labor_status"] == "formal").mean(),
-        "share_informal": (g["labor_status"] == "informal").mean(),
-        "share_self_employed": (g["labor_status"] == "self_employed").mean(),
-        "share_unemployed": (g["labor_status"] == "unemployed").mean(),
-        "share_inactive": (g["labor_status"] == "inactive").mean(),
-    })
-
-diag = pnadc.groupby(["year", "quarter"]).apply(_quarter_diag)
-print(diag.to_string())
-pnadc = pnadc.drop(columns=["_unmatched_bin"])
+    diagnostics["n_included"] = int(len(df))
+    diagnostics["n_unmatched"] = int(df["_unmatched_bin"].sum())
+    df.attrs["diagnostics"] = diagnostics
+    return df
 
 
-###############################################################################
-#            STEP 4 – MONTE CARLO TYPE ASSIGNMENT
-###############################################################################
-print("\n" + "=" * 72)
-print("STEP 4: MONTE CARLO AGENT-TYPE ASSIGNMENT")
-print("=" * 72)
-
-rng = np.random.default_rng(RANDOM_SEED)
-u = rng.random(len(pnadc))
-
-pnadc["agent_type"] = np.where(
-    u <= pnadc["p_ph2m"], "PH2M",
-    np.where(u <= pnadc["p_ph2m"] + pnadc["p_wh2m"], "WH2M", "Ricardian")
-)
-
-# Post-MC shares
-mc_shares = {}
-for t in ["PH2M", "WH2M", "Ricardian"]:
-    mc_shares[t] = pw[pnadc["agent_type"] == t].sum() / tw
-
-print("\n  ┌─────────────────────────────────────────────────────────┐")
-print("  │  PNADC Post-Monte Carlo Weighted Shares (Step 4)       │")
-print("  ├──────────────┬──────────────┬──────────────┬───────────┤")
-print(f"  │  PH2M        │  WH2M        │  Ricardian   │  N obs    │")
-print(f"  │  {mc_shares['PH2M']:.4f}      │  {mc_shares['WH2M']:.4f}      │  {mc_shares['Ricardian']:.4f}    │  {len(pnadc):>7,} │")
-print("  └──────────────┴──────────────┴──────────────┴───────────┘")
+# ============================================================================
+# Monthly aggregation
+# ============================================================================
 
 
-###############################################################################
-#      STEP 4b – EXPORT INDIVIDUAL-LEVEL AGENT-TYPE LABELS
-###############################################################################
-print("\n" + "=" * 72)
-print("STEP 4b: INDIVIDUAL-LEVEL AGENT-TYPE EXPORT")
-print("=" * 72)
-
-for t in ["PH2M", "WH2M", "Ricardian"]:
-    pnadc[f"is_{t}"] = (pnadc["agent_type"] == t).astype("int8")
-
-_ind_cols_wanted = [
-    "id_ind", "id_dom",
-    "year", "quarter",
-    "uf_code",
-    "weight",
-    "macro_region", "age_group", "gender",
-    "education_group", "labor_status", "pc_income_quintile",
-    "p_ph2m", "p_wh2m", "p_ric",
-    "agent_type",
-    "is_PH2M", "is_WH2M", "is_Ricardian",
-]
-ind_export_cols = [c for c in _ind_cols_wanted if c in pnadc.columns]
-
-ind_df = pnadc[ind_export_cols].copy()
-out_path_ind = TABLES_DIR / "individual_agent_types.parquet"
-ind_df.to_parquet(out_path_ind, index=False)
-print(f"\n  Saved {len(ind_df):,} individual-quarter rows → {out_path_ind}")
-print(f"  Columns: {ind_export_cols}")
-print(f"\n  Type distribution (unweighted):")
-print(ind_df["agent_type"].value_counts().to_string())
+def _safe_share(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    return (numerator / denominator.replace(0, np.nan)).fillna(0.0)
 
 
-###############################################################################
-#       STEP 5 – AGGREGATE TO STATE × QUARTER TYPE SHARES
-###############################################################################
-print("\n" + "=" * 72)
-print("STEP 5: STATE–QUARTER HTM SHARES")
-print("=" * 72)
+def _monthly_partial_columns() -> list[str]:
+    return MONTHLY_KEYS + [
+        "total_weight",
+        "n_obs",
+        "n_unmatched",
+        "_w_ph2m",
+        "_w_wh2m",
+        "_w_ric",
+        "share_PH2M",
+        "share_WH2M",
+        "share_Ricardian",
+        "share_H2M",
+    ]
 
-# Create weighted dummies
-for t in ["PH2M", "WH2M", "Ricardian"]:
-    pnadc[f"w_{t}"] = (pnadc["agent_type"] == t).astype(float) * pnadc["weight"]
 
-state_qtr = (
-    pnadc
-    .groupby(["uf_code", "year", "quarter"], as_index=False)
-    .agg(
-        total_weight=("weight", "sum"),
-        w_PH2M=("w_PH2M", "sum"),
-        w_WH2M=("w_WH2M", "sum"),
-        w_Ricardian=("w_Ricardian", "sum"),
+def _empty_monthly_partial() -> pd.DataFrame:
+    return pd.DataFrame(columns=_monthly_partial_columns())
+
+
+def _add_share_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    df["share_PH2M"] = _safe_share(df["_w_ph2m"], df["total_weight"])
+    df["share_WH2M"] = _safe_share(df["_w_wh2m"], df["total_weight"])
+    df["share_Ricardian"] = _safe_share(df["_w_ric"], df["total_weight"])
+    df["share_H2M"] = df["share_PH2M"] + df["share_WH2M"]
+    return df
+
+
+def aggregate_monthly_expected(batch_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate expected probability-weighted state-month shares for one batch."""
+    if batch_df.empty:
+        return _empty_monthly_partial()
+
+    tmp = batch_df.copy()
+    tmp["_w_ph2m"] = tmp["weight_monthly"] * tmp["p_ph2m"]
+    tmp["_w_wh2m"] = tmp["weight_monthly"] * tmp["p_wh2m"]
+    tmp["_w_ric"] = tmp["weight_monthly"] * tmp["p_ric"]
+
+    out = (
+        tmp.groupby(MONTHLY_KEYS, as_index=False)
+        .agg(
+            total_weight=("weight_monthly", "sum"),
+            n_obs=("weight_monthly", "size"),
+            n_unmatched=("_unmatched_bin", "sum"),
+            _w_ph2m=("_w_ph2m", "sum"),
+            _w_wh2m=("_w_wh2m", "sum"),
+            _w_ric=("_w_ric", "sum"),
+        )
     )
-)
-state_qtr["share_PH2M"]     = state_qtr["w_PH2M"]     / state_qtr["total_weight"]
-state_qtr["share_WH2M"]     = state_qtr["w_WH2M"]     / state_qtr["total_weight"]
-state_qtr["share_Ricardian"] = state_qtr["w_Ricardian"] / state_qtr["total_weight"]
-
-out_cols = ["uf_code", "year", "quarter",
-            "share_PH2M", "share_WH2M", "share_Ricardian", "total_weight"]
-state_qtr = state_qtr[out_cols].sort_values(["year", "quarter", "uf_code"])
-
-out_path_sq = TABLES_DIR / "state_quarter_htm_shares.csv"
-state_qtr.to_csv(out_path_sq, index=False)
-print(f"\n  Saved {len(state_qtr)} state-quarter rows → {out_path_sq}")
-print(f"\n  Preview:")
-print(state_qtr.head(10).to_string(index=False))
+    out["n_obs"] = out["n_obs"].astype(int)
+    out["n_unmatched"] = out["n_unmatched"].astype(int)
+    return _add_share_columns(out)
 
 
-###############################################################################
-#                     VALIDATION SUMMARY TABLE
-###############################################################################
-print("\n" + "=" * 72)
-print("VALIDATION: NATIONAL TYPE SHARES AT EACH STAGE")
-print("=" * 72)
+def aggregate_monthly_mc(batch_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate realised deterministic Monte Carlo state-month shares for one batch."""
+    if batch_df.empty:
+        return _empty_monthly_partial()
 
-summary = pd.DataFrame({
-    "Stage":    ["1. POF Classification", "3. PNADC Post-Merge (expected)", "4. PNADC Post-MC (realised)"],
-    "PH2M":     [pof_national["PH2M"],  merge_shares["PH2M"],  mc_shares["PH2M"]],
-    "WH2M":     [pof_national["WH2M"],  merge_shares["WH2M"],  mc_shares["WH2M"]],
-    "Ricardian": [pof_national["Ricardian"], merge_shares["Ricardian"], mc_shares["Ricardian"]],
-})
-summary["Total"] = summary["PH2M"] + summary["WH2M"] + summary["Ricardian"]
+    tmp = batch_df.copy()
+    tmp["_w_ph2m"] = tmp["weight_monthly"] * (tmp["agent_type"] == "PH2M").astype(float)
+    tmp["_w_wh2m"] = tmp["weight_monthly"] * (tmp["agent_type"] == "WH2M").astype(float)
+    tmp["_w_ric"] = tmp["weight_monthly"] * (tmp["agent_type"] == "Ricardian").astype(float)
 
-print("\n", summary.to_string(index=False))
+    out = (
+        tmp.groupby(MONTHLY_KEYS, as_index=False)
+        .agg(
+            total_weight=("weight_monthly", "sum"),
+            n_obs=("weight_monthly", "size"),
+            n_unmatched=("_unmatched_bin", "sum"),
+            _w_ph2m=("_w_ph2m", "sum"),
+            _w_wh2m=("_w_wh2m", "sum"),
+            _w_ric=("_w_ric", "sum"),
+        )
+    )
+    out["n_obs"] = out["n_obs"].astype(int)
+    out["n_unmatched"] = out["n_unmatched"].astype(int)
+    return _add_share_columns(out)
 
 
-###############################################################################
-#                     STEP 6 – CHOROPLETH MAPS PER QUARTER
-###############################################################################
-choropleth_generated = False
-if not args.no_choropleth:
+def _combine_monthly_partials(partials: list[pd.DataFrame]) -> pd.DataFrame:
+    frames = [p for p in partials if p is not None and not p.empty]
+    if not frames:
+        return pd.DataFrame(columns=FINAL_MONTHLY_COLUMNS)
+
+    combined = pd.concat(frames, ignore_index=True)
+    out = (
+        combined.groupby(MONTHLY_KEYS, as_index=False)
+        .agg(
+            total_weight=("total_weight", "sum"),
+            n_obs=("n_obs", "sum"),
+            n_unmatched=("n_unmatched", "sum"),
+            _w_ph2m=("_w_ph2m", "sum"),
+            _w_wh2m=("_w_wh2m", "sum"),
+            _w_ric=("_w_ric", "sum"),
+        )
+    )
+    out = _add_share_columns(out)
+    out["n_obs"] = out["n_obs"].astype(int)
+    out["n_unmatched"] = out["n_unmatched"].astype(int)
+    out = out[FINAL_MONTHLY_COLUMNS]
+    return out.sort_values(["year", "month", "uf_code"]).reset_index(drop=True)
+
+
+def _national_monthly_from_state_month(monthly: pd.DataFrame) -> pd.DataFrame:
+    if monthly.empty:
+        return pd.DataFrame(
+            columns=[
+                "ref_month_yyyymm",
+                "year",
+                "month",
+                "n_obs",
+                "n_unmatched",
+                "total_weight",
+                "national_share_PH2M",
+                "national_share_WH2M",
+                "national_share_Ricardian",
+                "national_share_H2M",
+            ]
+        )
+
+    tmp = monthly.copy()
+    tmp["_w_ph2m"] = tmp["share_PH2M"] * tmp["total_weight"]
+    tmp["_w_wh2m"] = tmp["share_WH2M"] * tmp["total_weight"]
+    tmp["_w_ric"] = tmp["share_Ricardian"] * tmp["total_weight"]
+    out = (
+        tmp.groupby(["ref_month_yyyymm", "year", "month"], as_index=False)
+        .agg(
+            n_obs=("n_obs", "sum"),
+            n_unmatched=("n_unmatched", "sum"),
+            total_weight=("total_weight", "sum"),
+            _w_ph2m=("_w_ph2m", "sum"),
+            _w_wh2m=("_w_wh2m", "sum"),
+            _w_ric=("_w_ric", "sum"),
+        )
+    )
+    out["national_share_PH2M"] = _safe_share(out["_w_ph2m"], out["total_weight"])
+    out["national_share_WH2M"] = _safe_share(out["_w_wh2m"], out["total_weight"])
+    out["national_share_Ricardian"] = _safe_share(out["_w_ric"], out["total_weight"])
+    out["national_share_H2M"] = out["national_share_PH2M"] + out["national_share_WH2M"]
+    return out.drop(columns=["_w_ph2m", "_w_wh2m", "_w_ric"])
+
+
+def _combine_exclusions_by_month(diagnostics: list[dict[str, Any]]) -> pd.DataFrame:
+    frames = [
+        d.get("excluded_by_month")
+        for d in diagnostics
+        if d is not None and d.get("excluded_by_month") is not None and not d["excluded_by_month"].empty
+    ]
+    if not frames:
+        return pd.DataFrame(
+            columns=[
+                "ref_month_yyyymm",
+                "year",
+                "month",
+                "excluded_missing_weight",
+                "raw_rows_with_known_month",
+            ]
+        )
+
+    combined = pd.concat(frames, ignore_index=True)
+    out = (
+        combined.groupby(["ref_month_yyyymm", "year", "month"], as_index=False)
+        .agg(
+            excluded_missing_weight=("excluded_missing_weight", "sum"),
+            raw_rows_with_known_month=("raw_rows_with_known_month", "sum"),
+        )
+    )
+    return out
+
+
+def _build_monthly_coverage(
+    expected_monthly: pd.DataFrame,
+    diagnostics: list[dict[str, Any]],
+) -> pd.DataFrame:
+    coverage = _national_monthly_from_state_month(expected_monthly)
+    exclusions = _combine_exclusions_by_month(diagnostics)
+
+    if coverage.empty and not exclusions.empty:
+        coverage = exclusions[["ref_month_yyyymm", "year", "month"]].copy()
+    elif not exclusions.empty:
+        coverage = coverage.merge(exclusions, on=["ref_month_yyyymm", "year", "month"], how="outer")
+
+    if "excluded_missing_weight" not in coverage.columns:
+        coverage["excluded_missing_weight"] = 0
+    if "raw_rows_with_known_month" not in coverage.columns:
+        coverage["raw_rows_with_known_month"] = 0
+
+    for col in [
+        "n_obs",
+        "n_unmatched",
+        "total_weight",
+        "national_share_PH2M",
+        "national_share_WH2M",
+        "national_share_Ricardian",
+        "national_share_H2M",
+    ]:
+        if col not in coverage.columns:
+            coverage[col] = 0
+    coverage[
+        [
+            "n_obs",
+            "n_unmatched",
+            "excluded_missing_weight",
+            "raw_rows_with_known_month",
+        ]
+    ] = coverage[
+        [
+            "n_obs",
+            "n_unmatched",
+            "excluded_missing_weight",
+            "raw_rows_with_known_month",
+        ]
+    ].fillna(0).astype(int)
+    coverage["total_weight"] = coverage["total_weight"].fillna(0.0)
+
+    totals = {
+        "raw_rows_total": sum(int(d.get("n_raw", 0)) for d in diagnostics),
+        "included_rows_total": sum(int(d.get("n_included", 0)) for d in diagnostics),
+        "missing_ref_month_total": sum(int(d.get("n_missing_ref_month", 0)) for d in diagnostics),
+        "missing_weight_monthly_total": sum(
+            int(d.get("n_missing_weight_monthly", 0)) for d in diagnostics
+        ),
+        "excluded_monthly_total": sum(int(d.get("n_excluded_monthly", 0)) for d in diagnostics),
+        "under_15_or_missing_age_total": sum(
+            int(d.get("n_under_15_or_missing_age", 0)) for d in diagnostics
+        ),
+        "missing_uf_total": sum(int(d.get("n_missing_uf", 0)) for d in diagnostics),
+        "unmatched_rows_total": sum(int(d.get("n_unmatched", 0)) for d in diagnostics),
+        "n_batches": len(diagnostics),
+    }
+    for col, value in totals.items():
+        coverage[col] = value
+
+    coverage["unmatched_share"] = (
+        coverage["n_unmatched"] / coverage["n_obs"].replace(0, np.nan)
+    ).fillna(0.0)
+    coverage = coverage.sort_values(["year", "month"]).reset_index(drop=True)
+    ordered = [
+        "ref_month_yyyymm",
+        "year",
+        "month",
+        "n_obs",
+        "n_unmatched",
+        "unmatched_share",
+        "total_weight",
+        "national_share_PH2M",
+        "national_share_WH2M",
+        "national_share_Ricardian",
+        "national_share_H2M",
+        "excluded_missing_weight",
+        "raw_rows_with_known_month",
+        "raw_rows_total",
+        "included_rows_total",
+        "missing_ref_month_total",
+        "missing_weight_monthly_total",
+        "excluded_monthly_total",
+        "under_15_or_missing_age_total",
+        "missing_uf_total",
+        "unmatched_rows_total",
+        "n_batches",
+    ]
+    return coverage[ordered]
+
+
+def finalize_monthly_outputs(
+    partials: list[dict[str, Any]],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Combine batch partials into expected, MC, and coverage outputs."""
+    expected = _combine_monthly_partials([p["expected"] for p in partials])
+    mc = _combine_monthly_partials([p["mc"] for p in partials])
+    diagnostics = [p["diagnostics"] for p in partials]
+    coverage = _build_monthly_coverage(expected, diagnostics)
+    return expected, mc, coverage
+
+
+# ============================================================================
+# PNADC parquet streaming and output
+# ============================================================================
+
+
+def _validate_pnadc_schema(parquet_file: pq.ParquetFile) -> list[str]:
+    available = set(parquet_file.schema_arrow.names)
+    missing = sorted(set(PNADC_REQUIRED_COLUMNS) - available)
+    if missing:
+        raise ValueError(f"PNADC parquet is missing required columns: {missing}")
+    if not any(col in available for col in PNADC_ID_COLUMNS):
+        raise ValueError("PNADC parquet must contain id_rs or id_ind for deterministic MC draws.")
+    return [col for col in PNADC_BATCH_COLUMNS if col in available]
+
+
+def process_pnadc_parquet(
+    pnad_path: Path,
+    bin_shares: pd.DataFrame,
+    pof_quintile_edges: np.ndarray,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    per_quarter_quintiles: bool = False,
+    random_seed: int = RANDOM_SEED,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Stream PNADC parquet batches and return finalized monthly outputs."""
+    parquet_file = pq.ParquetFile(pnad_path)
+    columns = _validate_pnadc_schema(parquet_file)
+    total_rows = parquet_file.metadata.num_rows if parquet_file.metadata is not None else None
+
+    if verbose:
+        total_msg = f"{total_rows:,}" if total_rows is not None else "unknown"
+        print("\n" + "=" * 72)
+        print("STEP 3: STREAM PNADC PARQUET & MERGE POF BIN SHARES")
+        print("=" * 72)
+        print(f"  Input: {pnad_path}")
+        print(f"  Parquet rows: {total_msg}")
+        print(f"  Batch size: {batch_size:,}")
+        if per_quarter_quintiles:
+            print("  Using legacy within-batch per-quarter quintiles.")
+
+    partials: list[dict[str, Any]] = []
+    processed = 0
+    for batch_no, record_batch in enumerate(
+        parquet_file.iter_batches(batch_size=batch_size, columns=columns),
+        start=1,
+    ):
+        batch_df = record_batch.to_pandas()
+        prepared = prepare_pnadc_batch(
+            batch_df,
+            bin_shares,
+            pof_quintile_edges,
+            per_quarter_quintiles=per_quarter_quintiles,
+            random_seed=random_seed,
+        )
+        expected_partial = aggregate_monthly_expected(prepared)
+        mc_partial = aggregate_monthly_mc(prepared)
+        diagnostics = prepared.attrs["diagnostics"]
+        partials.append(
+            {
+                "expected": expected_partial,
+                "mc": mc_partial,
+                "diagnostics": diagnostics,
+            }
+        )
+        processed += len(batch_df)
+        if verbose:
+            total_fragment = f" / {total_rows:,}" if total_rows is not None else ""
+            print(
+                f"  Batch {batch_no}: raw={len(batch_df):,}, "
+                f"included={diagnostics['n_included']:,}, "
+                f"unmatched={diagnostics['n_unmatched']:,}, "
+                f"processed={processed:,}{total_fragment}"
+            )
+
+    if not partials:
+        return finalize_monthly_outputs([])
+    return finalize_monthly_outputs(partials)
+
+
+def aggregate_monthly_to_legacy_quarterly(monthly: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate canonical monthly expected shares to legacy state-quarter shares."""
+    if monthly.empty:
+        return pd.DataFrame(
+            columns=[
+                "uf_code",
+                "year",
+                "quarter",
+                "share_PH2M",
+                "share_WH2M",
+                "share_Ricardian",
+                "share_H2M",
+                "total_weight",
+                "n_obs",
+                "n_unmatched",
+            ]
+        )
+
+    tmp = monthly.copy()
+    tmp["quarter"] = ((tmp["month"].astype(int) - 1) // 3 + 1).astype(int)
+    tmp["_w_ph2m"] = tmp["share_PH2M"] * tmp["total_weight"]
+    tmp["_w_wh2m"] = tmp["share_WH2M"] * tmp["total_weight"]
+    tmp["_w_ric"] = tmp["share_Ricardian"] * tmp["total_weight"]
+    out = (
+        tmp.groupby(["uf_code", "year", "quarter"], as_index=False)
+        .agg(
+            total_weight=("total_weight", "sum"),
+            n_obs=("n_obs", "sum"),
+            n_unmatched=("n_unmatched", "sum"),
+            _w_ph2m=("_w_ph2m", "sum"),
+            _w_wh2m=("_w_wh2m", "sum"),
+            _w_ric=("_w_ric", "sum"),
+        )
+    )
+    out = _add_share_columns(out)
+    out["n_obs"] = out["n_obs"].astype(int)
+    out["n_unmatched"] = out["n_unmatched"].astype(int)
+    cols = [
+        "uf_code",
+        "year",
+        "quarter",
+        "share_PH2M",
+        "share_WH2M",
+        "share_Ricardian",
+        "share_H2M",
+        "total_weight",
+        "n_obs",
+        "n_unmatched",
+    ]
+    return out[cols].sort_values(["year", "quarter", "uf_code"]).reset_index(drop=True)
+
+
+def _write_outputs(
+    expected: pd.DataFrame,
+    mc: pd.DataFrame,
+    coverage: pd.DataFrame,
+    *,
+    tables_dir: Path = TABLES_DIR,
+    diagnostics_dir: Path = DIAGNOSTICS_DIR,
+    write_legacy_quarterly: bool = True,
+) -> dict[str, Path]:
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = {
+        "monthly_expected": tables_dir / "state_month_htm_shares.parquet",
+        "monthly_mc": tables_dir / "state_month_htm_shares_mc.parquet",
+        "coverage": diagnostics_dir / "monthly_htm_coverage.csv",
+    }
+    expected.to_parquet(paths["monthly_expected"], index=False)
+    mc.to_parquet(paths["monthly_mc"], index=False)
+    coverage.to_csv(paths["coverage"], index=False)
+
+    if write_legacy_quarterly:
+        quarterly = aggregate_monthly_to_legacy_quarterly(expected)
+        paths["legacy_quarterly"] = tables_dir / "state_quarter_htm_shares.csv"
+        quarterly.to_csv(paths["legacy_quarterly"], index=False)
+
+    return paths
+
+
+def _weighted_national_from_monthly(monthly: pd.DataFrame) -> dict[str, float]:
+    total_weight = monthly["total_weight"].sum()
+    if total_weight <= 0:
+        return {"PH2M": np.nan, "WH2M": np.nan, "Ricardian": np.nan}
+    return {
+        "PH2M": float((monthly["share_PH2M"] * monthly["total_weight"]).sum() / total_weight),
+        "WH2M": float((monthly["share_WH2M"] * monthly["total_weight"]).sum() / total_weight),
+        "Ricardian": float(
+            (monthly["share_Ricardian"] * monthly["total_weight"]).sum() / total_weight
+        ),
+    }
+
+
+def _print_validation_summary(
+    pof_national: dict[str, float],
+    expected: pd.DataFrame,
+    mc: pd.DataFrame,
+) -> None:
+    expected_nat = _weighted_national_from_monthly(expected)
+    mc_nat = _weighted_national_from_monthly(mc)
+    summary = pd.DataFrame(
+        {
+            "Stage": [
+                "1. POF Classification",
+                "3. PNADC monthly expected",
+                "4. PNADC monthly MC diagnostic",
+            ],
+            "PH2M": [pof_national["p_ph2m"], expected_nat["PH2M"], mc_nat["PH2M"]],
+            "WH2M": [pof_national["p_wh2m"], expected_nat["WH2M"], mc_nat["WH2M"]],
+            "Ricardian": [pof_national["p_ric"], expected_nat["Ricardian"], mc_nat["Ricardian"]],
+        }
+    )
+    summary["Total"] = summary["PH2M"] + summary["WH2M"] + summary["Ricardian"]
+
+    print("\n" + "=" * 72)
+    print("VALIDATION: NATIONAL TYPE SHARES AT EACH STAGE")
+    print("=" * 72)
+    print(summary.to_string(index=False))
+
+
+def generate_quarterly_choropleths(state_qtr: pd.DataFrame, output_dir: Path = PLOTS_DIR) -> bool:
+    """Generate legacy per-quarter choropleths from a state-quarter DataFrame."""
+    try:
+        from generate_choropleths import (
+            compute_global_vmin_vmax,
+            load_ibge_shapefile,
+            plot_choropleth,
+        )
+    except Exception as exc:
+        print(f"  Could not import choropleth helpers: {exc}")
+        return False
+
+    state_qtr_valid = state_qtr.dropna(subset=["year", "quarter"])
+    if state_qtr_valid.empty:
+        print("  No valid state-quarter rows for choropleths.")
+        return False
+
     print("\n" + "=" * 72)
     print("STEP 6: CHOROPLETH MAPS")
     print("=" * 72)
-
-    # Download IBGE state boundaries
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    shp_url = (
-        "https://geoftp.ibge.gov.br/organizacao_do_territorio/"
-        "malhas_territoriais/malhas_municipais/municipio_2022/"
-        "Brasil/BR/BR_UF_2022.zip"
-    )
-    shp_dir = Path(tempfile.mkdtemp())
-    brazil = None
+    print("  Downloading IBGE state boundaries...")
     try:
-        req = urllib_request.Request(shp_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib_request.urlopen(req, timeout=120, context=ctx) as r:
-            with zipfile.ZipFile(io.BytesIO(r.read())) as z:
-                z.extractall(shp_dir)
-        brazil = gpd.read_file(next(shp_dir.glob("*.shp"))).to_crs("EPSG:4326")
-    except Exception as e:
-        print(f"  ⚠  Could not download IBGE shapefile: {e}")
+        brazil, regions_gdf = load_ibge_shapefile()
+    except Exception as exc:
+        print(f"  Could not download IBGE shapefile: {exc}")
         print("  Skipping choropleth generation. Run again or use --no-choropleth.")
-    if brazil is not None:
-        brazil["uf_code"] = brazil["CD_UF"].astype(int)
+        return False
 
-        region_map = {
-            "Norte": ["AM", "PA", "AC", "RO", "RR", "AP", "TO"],
-            "Nordeste": ["MA", "PI", "CE", "RN", "PB", "PE", "AL", "SE", "BA"],
-            "Sudeste": ["MG", "ES", "RJ", "SP"],
-            "Sul": ["PR", "SC", "RS"],
-            "Centro-Oeste": ["MT", "MS", "GO", "DF"],
-        }
-        sigla_to_region = {s: r for r, states in region_map.items() for s in states}
-        brazil["macro_region"] = brazil["SIGLA_UF"].map(sigla_to_region)
-        regions_gdf = brazil.dissolve(by="macro_region").reset_index()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    vmin_vmax = compute_global_vmin_vmax(state_qtr_valid)
+    generated = False
+    for (yr, qtr), grp in state_qtr_valid.groupby(["year", "quarter"]):
+        yr, qtr = int(yr), int(qtr)
+        htm_q = grp.assign(uf_code=lambda d: d["uf_code"].astype(int)).copy()
+        htm_q["PH2M"] = htm_q["share_PH2M"]
+        htm_q["WH2M"] = htm_q["share_WH2M"]
+        htm_q["Ricardian"] = htm_q["share_Ricardian"]
+        htm_q["total_HtM"] = htm_q["PH2M"] + htm_q["WH2M"]
+        gdf = brazil.merge(
+            htm_q[["uf_code", "PH2M", "WH2M", "Ricardian", "total_HtM", "total_weight"]],
+            on="uf_code",
+            how="left",
+        )
+        out_png = output_dir / f"choropleth_htm_{yr}Q{qtr}.png"
+        plot_choropleth(gdf, regions_gdf, grp, yr, qtr, out_png, vmin_vmax)
+        print(f"  Saved {out_png.name}")
+        generated = True
+    return generated
 
-        panels = [
-            ("PH2M", "Poor HtM", "#b2182b", "#fddbc7"),
-            ("WH2M", "Wealthy HtM", "#2166ac", "#d1e5f0"),
-            ("total_HtM", "Total HtM", "#542788", "#f7f7f7"),
-            ("Ricardian", "Ricardian", "#1b7837", "#d9f0d3"),
-        ]
 
-        state_qtr_valid = state_qtr.dropna(subset=["year", "quarter"])
-        for (yr, qtr), grp in state_qtr_valid.groupby(["year", "quarter"]):
-            yr, qtr = int(yr), int(qtr)
-            htm_q = grp.assign(uf_code=lambda d: d["uf_code"].astype(int)).copy()
-            htm_q["PH2M"] = htm_q["share_PH2M"]
-            htm_q["WH2M"] = htm_q["share_WH2M"]
-            htm_q["Ricardian"] = htm_q["share_Ricardian"]
-            htm_q["total_HtM"] = htm_q["PH2M"] + htm_q["WH2M"]
-            gdf = brazil.merge(htm_q[["uf_code", "PH2M", "WH2M", "Ricardian", "total_HtM", "total_weight"]],
-                              on="uf_code", how="left")
+# ============================================================================
+# CLI
+# ============================================================================
 
-            fig, axes = plt.subplots(2, 2, figsize=(16, 14))
-            fig.patch.set_facecolor("#F7F4EF")
-            axes = axes.flatten()
 
-            for ax, (col, title, dark, light) in zip(axes, panels):
-                ax.set_facecolor("#cce5f0")
-                valid = gdf[col].dropna()
-                vmin = valid.quantile(0.05) if len(valid) > 0 else 0
-                vmax = valid.quantile(0.95) if len(valid) > 0 else 1
-                cmap = mcolors.LinearSegmentedColormap.from_list(col, [light, dark], N=256)
-                gdf.plot(column=col, ax=ax, cmap=cmap, vmin=vmin, vmax=vmax,
-                         linewidth=0.35, edgecolor="white",
-                         missing_kwds={"color": "#cccccc"})
-                regions_gdf.plot(ax=ax, facecolor="none", edgecolor="#222222", linewidth=1.6)
-                for _, row in gdf.iterrows():
-                    pt = row.geometry.representative_point()
-                    if pd.notna(row[col]):
-                        ax.annotate(row["SIGLA_UF"], xy=(pt.x, pt.y), ha="center", va="center",
-                                    fontsize=5.2, color="white", fontweight="bold",
-                                    path_effects=[pe.withStroke(linewidth=1.2, foreground="#00000055")])
-                for _, rrow in regions_gdf.iterrows():
-                    rpt = rrow.geometry.centroid
-                    ax.annotate(rrow["macro_region"], xy=(rpt.x, rpt.y), ha="center", va="center",
-                                fontsize=7, color="#111111", fontstyle="italic", fontweight="bold", alpha=0.55)
-                sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
-                sm.set_array([])
-                cbar = fig.colorbar(sm, ax=ax, fraction=0.028, pad=0.02, shrink=0.72)
-                cbar.ax.yaxis.set_tick_params(labelsize=8, color="0.4")
-                cbar.set_label("Share", fontsize=8, color="0.4")
-                cbar.ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
-                valid_gdf = gdf[gdf[col].notna()]
-                if len(valid_gdf) > 0:
-                    lo_row = gdf.loc[gdf[col].idxmin()]
-                    hi_row = gdf.loc[gdf[col].idxmax()]
-                    ax.set_title(f"{title} share\n↑ {hi_row['SIGLA_UF']} {hi_row[col]:.1%}   "
-                                 f"↓ {lo_row['SIGLA_UF']} {lo_row[col]:.1%}",
-                                 fontsize=11, pad=8, color="#111111")
-                else:
-                    ax.set_title(f"{title} share", fontsize=11, pad=8, color="#111111")
-                ax.axis("off")
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="HTM Agent Classification Pipeline")
+    parser.add_argument("--no-choropleth", action="store_true", help="Skip choropleth map generation")
+    parser.add_argument(
+        "--per-quarter-quintiles",
+        action="store_true",
+        help=(
+            "Use legacy within-batch per-quarter PNADC quintiles instead of "
+            "POF cut-points. Default keeps POF cut-points."
+        ),
+    )
+    parser.add_argument(
+        "--pnad-parquet",
+        type=Path,
+        default=None,
+        help="Path to PNADC monthly matched parquet (default: pnadc_matched_with_periods.parquet)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"PNADC parquet batch size (default: {DEFAULT_BATCH_SIZE:,})",
+    )
+    parser.add_argument(
+        "--no-legacy-quarterly",
+        action="store_true",
+        help="Do not write legacy results/tables/state_quarter_htm_shares.csv",
+    )
+    return parser.parse_args(argv)
 
-            wt = gdf["uf_code"].map(grp.set_index("uf_code")["total_weight"]).fillna(1)
 
-            def wnat(c):
-                return np.average(gdf[c].fillna(0), weights=wt)
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    pnad_path = args.pnad_parquet if args.pnad_parquet is not None else PNAD_MATCHED_DEFAULT
+    if not pnad_path.exists():
+        raise FileNotFoundError(
+            f"PNADC Parquet not found: {pnad_path}. Add the file or pass --pnad-parquet PATH."
+        )
 
-            fig.suptitle(
-                f"HTM Agent-Type Shares by Brazilian State  (PNADC {yr} Q{qtr})\n"
-                f"Population-weighted national:  PH2M {wnat('PH2M'):.1%}  │  "
-                f"WH2M {wnat('WH2M'):.1%}  │  Total HtM {wnat('total_HtM'):.1%}  │  "
-                f"Ricardian {wnat('Ricardian'):.1%}\n"
-                "Bold borders = macro-region boundaries",
-                fontsize=11, y=1.005, color="#111111", linespacing=1.7)
-            plt.tight_layout(h_pad=3, w_pad=2)
-            out_png = PLOTS_DIR / f"choropleth_htm_{yr}Q{qtr}.png"
-            fig.savefig(out_png, dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            print(f"  Saved {out_png.name}")
-            choropleth_generated = True
+    bin_shares, pof_quintile_edges, pof_national = build_pof_bin_shares()
+    expected, mc, coverage = process_pnadc_parquet(
+        pnad_path,
+        bin_shares,
+        pof_quintile_edges,
+        batch_size=args.batch_size,
+        per_quarter_quintiles=args.per_quarter_quintiles,
+        random_seed=RANDOM_SEED,
+        verbose=True,
+    )
 
-print("\n✅ Pipeline complete. Output files:")
-print(f"   • {out_path_bins}")
-print(f"   • {out_path_sq}")
-print(f"   • {out_path_ind}")
-if choropleth_generated:
-    print(f"   • choropleth_htm_*.png (per quarter)")
+    print("\n" + "=" * 72)
+    print("STEP 5: STATE-MONTH HTM SHARES")
+    print("=" * 72)
+    paths = _write_outputs(
+        expected,
+        mc,
+        coverage,
+        write_legacy_quarterly=not args.no_legacy_quarterly,
+    )
+    print(f"  Saved {len(expected):,} monthly expected rows -> {paths['monthly_expected']}")
+    print(f"  Saved {len(mc):,} monthly MC diagnostic rows -> {paths['monthly_mc']}")
+    print(f"  Saved monthly coverage diagnostics -> {paths['coverage']}")
+    if "legacy_quarterly" in paths:
+        print(f"  Saved legacy quarterly shares -> {paths['legacy_quarterly']}")
+
+    _print_validation_summary(pof_national, expected, mc)
+
+    choropleth_generated = False
+    if not args.no_choropleth:
+        quarterly = aggregate_monthly_to_legacy_quarterly(expected)
+        choropleth_generated = generate_quarterly_choropleths(quarterly, PLOTS_DIR)
+
+    print("\nPipeline complete. Output files:")
+    print(f"  - {paths['monthly_expected']}")
+    print(f"  - {paths['monthly_mc']}")
+    print(f"  - {paths['coverage']}")
+    if "legacy_quarterly" in paths:
+        print(f"  - {paths['legacy_quarterly']}")
+    if choropleth_generated:
+        print("  - results/plots/choropleth_htm_*.png")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
