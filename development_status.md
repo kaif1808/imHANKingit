@@ -1,5 +1,79 @@
 # Development Status
 
+## Latest Update — 2026-04-30
+
+### Root clutter reduction: non-script loose files archived
+
+Performed a second root-cleanup pass to move non-script loose artifacts out of the repository root and into a dedicated legacy holding area.
+
+**What was done:**
+
+- Moved previously root-level ad hoc files to `archive/legacy/root_loose_files/`:
+  - `consume_state.csv`, `monetary_shocks.csv`
+  - `pnadc_2016_1.rds`, `pnadc_2017_1.rds`, `pnadc_2018_1.rds`, `pnadc_2019_1.rds`
+  - `pnadc_panel_3.csv`, `pnadc_panel_4.csv`
+  - `plotnine 1.png`, `Voicy_YAHOO.mp3`
+- Removed root cache folder `__pycache__/`.
+- Retired empty `chloropleths/` legacy directory.
+- Updated docs to reflect new location of loose root artifacts:
+  - `README.md`
+  - `SCRIPT_CONSOLIDATION_MAP.md`
+
+**Updated files:** `README.md`, `SCRIPT_CONSOLIDATION_MAP.md`, `development_status.md`, plus file relocations under `archive/legacy/root_loose_files/`
+
+## Latest Update — 2026-04-30
+
+### Script organization overhaul (phase 1) + consolidation baseline (phase 2)
+
+Reduced root-level clutter by reorganizing loose scripts into purpose-based folders, then established canonical workflow and guardrails for ongoing script maintenance.
+
+**What was done:**
+
+- Created script organization directories:
+  - `scripts/data_prep/`
+  - `scripts/reporting/`
+  - `scripts/utils/`
+  - `analysis/`
+  - `archive/legacy/`
+- Rehomed loose scripts from repo root:
+  - `convert_report_to_notebook.py` -> `scripts/utils/`
+  - `fix_notebook_markdown.py` -> `scripts/utils/`
+  - `pnad.r` and `install.R` -> `scripts/data_prep/`
+  - `irf_heterogeneity_final.R` -> `scripts/reporting/`
+  - `test.r` and `test_approach_b.R` -> `analysis/`
+- Archived non-canonical artifacts and superseded scripts under `archive/legacy/`, including:
+  - `irf_heterogeneity_analysis.R` (superseded)
+  - old planning/export artifacts and `new_function/`
+- Added script documentation:
+  - `scripts/README.md` (folder purpose, canonical workflow, deprecations, guardrails)
+  - `SCRIPT_CONSOLIDATION_MAP.md` (canonical vs exploratory vs legacy classification)
+- Updated root `README.md` with a clear “Where scripts live” section and moved-path references.
+- Added `tests/test_repo_structure.py` as a lightweight guardrail so script clutter does not regress.
+
+**Updated files:** `README.md`, `development_status.md`, `scripts/README.md`, `SCRIPT_CONSOLIDATION_MAP.md`, `tests/test_repo_structure.py`, plus script relocations across `scripts/`, `analysis/`, and `archive/legacy/`
+
+## Latest Update — 2026-04-30
+
+### Repository hygiene cleanup + results provenance manifest
+
+Completed a safe repo-hygiene pass focused on keeping generated research outputs while reducing git noise and documenting reproducibility ownership for `results/`.
+
+**What was done:**
+
+- Added stronger ignore rules in `.gitignore` for machine-local clutter (`.DS_Store`) and Python cache artifacts (`__pycache__`, `*.py[cod]`), plus generated report companion folders (`*_files/`).
+- Removed tracked macOS metadata files under `results/`:
+  - `results/.DS_Store`
+  - `results/plots/.DS_Store`
+  - `results/tables/.DS_Store`
+  - `results/reports/irf_diagnostics_writeup_files/.DS_Store`
+- Added `RESULTS_PROVENANCE.md` with explicit artifact family -> producer script mapping and rerun commands for:
+  - `htm_classification.py`
+  - `generate_choropleths.py`
+  - `cumulative_irf_heterogeneity.py`
+- Updated `README.md` to point to `RESULTS_PROVENANCE.md` as the canonical provenance reference for generated outputs.
+
+**Updated files:** `.gitignore`, `RESULTS_PROVENANCE.md`, `README.md`, `development_status.md`
+
 ## Latest Update — 2026-04-24
 
 ### HTM pipeline: PNADC input from `pnad_matched.parquet`
