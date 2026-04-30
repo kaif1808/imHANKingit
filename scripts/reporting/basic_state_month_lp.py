@@ -42,20 +42,30 @@ MATCH_REQUIRED_COLS = ["consumption_index", "mp_shock", *SHARE_COLS]
 RESPONSE_TYPES = ("cumulative", "marginal")
 SHOCK_VARIABLE = "mp_shock"
 SHOCK_TYPE = "Monthly monetary-policy shock from DI surprise"
+INTERACTION_TERMS = ["mp_shock_x_share_PH2M", "mp_shock_x_share_WH2M"]
+PREFERRED_SPECS = ["lag1_time_fe", "lag2_time_fe"]
+DEFAULT_PLOT_SHARE_DELTA = 0.10
 SHOCK_DIRECTIONS = {
-    "positive": {
+    "contractionary_rate_surprise": {
         "multiplier": 1.0,
-        "direction": "positive signed shock",
-        "unit": "one-unit increase in mp_shock; negative shocks enter as negative values",
-        "plot_label": "Positive MP Shock",
+        "direction": "contractionary_rate_surprise",
+        "unit": "one-unit positive DI/rate surprise; positive mp_shock is contractionary",
+        "plot_label": "Contractionary Rate Surprise",
     },
-    "negative": {
+    "expansionary_rate_surprise": {
         "multiplier": -1.0,
-        "direction": "negative signed shock",
-        "unit": "one-unit decrease in mp_shock; source mp_shock values are sign-flipped for this reported IRF",
-        "plot_label": "Negative MP Shock",
+        "direction": "expansionary_rate_surprise",
+        "unit": "one-unit negative DI/rate surprise; source mp_shock values are sign-flipped for this reported IRF",
+        "plot_label": "Expansionary Rate Surprise",
     },
 }
+SHOCK_DIRECTION_ALIASES = {
+    "positive": "contractionary_rate_surprise",
+    "negative": "expansionary_rate_surprise",
+}
+SHOCK_DIRECTION_CHOICES = sorted(
+    {*SHOCK_DIRECTIONS.keys(), *SHOCK_DIRECTION_ALIASES.keys(), "both"}
+)
 
 UF_NAMES = {
     11: "Rondonia",
@@ -116,12 +126,26 @@ def parse_args() -> argparse.Namespace:
         default="results/diagnostics/shock_transformation_log.csv",
         type=Path,
     )
-    parser.add_argument("--max-horizon", default=24, type=int)
+    parser.add_argument("--max-horizon", default=48, type=int)
     parser.add_argument(
         "--shock-direction",
-        choices=sorted(SHOCK_DIRECTIONS),
-        default="negative",
-        help="Orient reported mp_shock IRFs to a positive or negative signed shock.",
+        choices=SHOCK_DIRECTION_CHOICES,
+        default="both",
+        help=(
+            "Orient reported mp_shock IRFs. Use contractionary_rate_surprise for "
+            "positive DI/rate surprises, expansionary_rate_surprise for negative "
+            "DI/rate surprises, or both. Legacy aliases positive/negative are accepted."
+        ),
+    )
+    parser.add_argument(
+        "--plot-share-delta",
+        default=DEFAULT_PLOT_SHARE_DELTA,
+        type=float,
+        help=(
+            "Household-share contrast used to scale plotted exposure IRFs. "
+            "Default 0.10 plots the response to a 10 percentage point higher "
+            "PH2M/WH2M share."
+        ),
     )
     parser.add_argument(
         "--dataset-out",
@@ -315,6 +339,10 @@ def build_matched_panel(
             offset=-lag,
             column_name=f"lag{lag}_log_consumption",
         )
+    for col in SHARE_COLS:
+        matched[f"lag1_{col}"] = matched.groupby("uf_code", sort=False)[col].shift(1)
+    matched["mp_shock_x_share_PH2M"] = matched["mp_shock"] * matched["lag1_share_PH2M"]
+    matched["mp_shock_x_share_WH2M"] = matched["mp_shock"] * matched["lag1_share_WH2M"]
     matched["uf_code_str"] = matched["uf_code"].astype(str)
     matched["date_str"] = matched["date"].dt.strftime("%Y-%m")
     matched["state_name"] = matched["uf_code"].map(UF_NAMES).fillna(matched["state"])
@@ -410,10 +438,24 @@ def _fit_one_state_lp(reg_df: pd.DataFrame, formula: str):
     return smf.ols(formula=formula, data=reg_df).fit(cov_type="HC1")
 
 
-def _shock_metadata(shock_direction: str) -> dict[str, object]:
-    if shock_direction not in SHOCK_DIRECTIONS:
+def _canonical_shock_direction(shock_direction: str) -> str:
+    return SHOCK_DIRECTION_ALIASES.get(shock_direction, shock_direction)
+
+
+def _selected_shock_directions(shock_direction: str) -> list[str]:
+    if shock_direction == "both":
+        return list(SHOCK_DIRECTIONS)
+    canonical = _canonical_shock_direction(shock_direction)
+    if canonical not in SHOCK_DIRECTIONS:
         raise ValueError(f"Unknown shock_direction={shock_direction}")
-    meta = SHOCK_DIRECTIONS[shock_direction]
+    return [canonical]
+
+
+def _shock_metadata(shock_direction: str) -> dict[str, object]:
+    canonical = _canonical_shock_direction(shock_direction)
+    if canonical not in SHOCK_DIRECTIONS:
+        raise ValueError(f"Unknown shock_direction={shock_direction}")
+    meta = SHOCK_DIRECTIONS[canonical]
     return {
         "shock_variable": SHOCK_VARIABLE,
         "shock_type": SHOCK_TYPE,
@@ -428,35 +470,43 @@ def _spec_definitions(include_time_fe: bool) -> dict[str, dict[str, object]]:
     specs = {
         "lag1": {
             "formula": (
-                "y_resp ~ mp_shock + share_PH2M + share_WH2M "
+                "y_resp ~ mp_shock + mp_shock_x_share_PH2M + mp_shock_x_share_WH2M "
+                "+ lag1_share_PH2M + lag1_share_WH2M "
                 "+ lag1_log_consumption + C(uf_code_str)"
             ),
             "required": [
                 "y_resp",
                 "mp_shock",
-                "share_PH2M",
-                "share_WH2M",
+                "mp_shock_x_share_PH2M",
+                "mp_shock_x_share_WH2M",
+                "lag1_share_PH2M",
+                "lag1_share_WH2M",
                 "lag1_log_consumption",
                 "uf_code_str",
                 "uf_code",
             ],
+            "reported_terms": ["mp_shock", *INTERACTION_TERMS],
             "with_time_fe": False,
         },
         "lag2": {
             "formula": (
-                "y_resp ~ mp_shock + share_PH2M + share_WH2M "
+                "y_resp ~ mp_shock + mp_shock_x_share_PH2M + mp_shock_x_share_WH2M "
+                "+ lag1_share_PH2M + lag1_share_WH2M "
                 "+ lag1_log_consumption + lag2_log_consumption + C(uf_code_str)"
             ),
             "required": [
                 "y_resp",
                 "mp_shock",
-                "share_PH2M",
-                "share_WH2M",
+                "mp_shock_x_share_PH2M",
+                "mp_shock_x_share_WH2M",
+                "lag1_share_PH2M",
+                "lag1_share_WH2M",
                 "lag1_log_consumption",
                 "lag2_log_consumption",
                 "uf_code_str",
                 "uf_code",
             ],
+            "reported_terms": ["mp_shock", *INTERACTION_TERMS],
             "with_time_fe": False,
         },
     }
@@ -466,35 +516,43 @@ def _spec_definitions(include_time_fe: bool) -> dict[str, dict[str, object]]:
             {
                 "lag1_time_fe": {
                     "formula": (
-                        "y_resp ~ share_PH2M + share_WH2M + lag1_log_consumption "
+                        "y_resp ~ mp_shock_x_share_PH2M + mp_shock_x_share_WH2M "
+                        "+ lag1_share_PH2M + lag1_share_WH2M + lag1_log_consumption "
                         "+ C(uf_code_str) + C(date_str)"
                     ),
                     "required": [
                         "y_resp",
-                        "share_PH2M",
-                        "share_WH2M",
+                        "mp_shock_x_share_PH2M",
+                        "mp_shock_x_share_WH2M",
+                        "lag1_share_PH2M",
+                        "lag1_share_WH2M",
                         "lag1_log_consumption",
                         "uf_code_str",
                         "date_str",
                         "uf_code",
                     ],
+                    "reported_terms": INTERACTION_TERMS,
                     "with_time_fe": True,
                 },
                 "lag2_time_fe": {
                     "formula": (
-                        "y_resp ~ share_PH2M + share_WH2M + lag1_log_consumption "
+                        "y_resp ~ mp_shock_x_share_PH2M + mp_shock_x_share_WH2M "
+                        "+ lag1_share_PH2M + lag1_share_WH2M + lag1_log_consumption "
                         "+ lag2_log_consumption + C(uf_code_str) + C(date_str)"
                     ),
                     "required": [
                         "y_resp",
-                        "share_PH2M",
-                        "share_WH2M",
+                        "mp_shock_x_share_PH2M",
+                        "mp_shock_x_share_WH2M",
+                        "lag1_share_PH2M",
+                        "lag1_share_WH2M",
                         "lag1_log_consumption",
                         "lag2_log_consumption",
                         "uf_code_str",
                         "date_str",
                         "uf_code",
                     ],
+                    "reported_terms": INTERACTION_TERMS,
                     "with_time_fe": True,
                 },
             }
@@ -534,15 +592,131 @@ def _state_spec_definitions() -> dict[str, dict[str, object]]:
     }
 
 
+def _term_metadata(term: str, with_time_fe: bool) -> dict[str, object]:
+    if term == "mp_shock":
+        return {
+            "term_label": "Ricardian-baseline shock level effect",
+            "term_role": "baseline_level_effect",
+            "household_exposure": "Ricardian_baseline",
+            "baseline_household_type": "Ricardian",
+            "term_note": (
+                "No Ricardian interaction is included; in non-time-FE specs, mp_shock "
+                "is the omitted Ricardian-share baseline level effect."
+            ),
+        }
+    if term == "mp_shock_x_share_PH2M":
+        return {
+            "term_label": "Shock x lagged PH2M share exposure",
+            "term_role": "household_share_interaction",
+            "household_exposure": "PH2M",
+            "baseline_household_type": "Ricardian",
+            "term_note": (
+                "Interaction of mp_shock with lagged PH2M state share; Ricardian "
+                "share interaction is the omitted baseline."
+            ),
+        }
+    if term == "mp_shock_x_share_WH2M":
+        return {
+            "term_label": "Shock x lagged WH2M share exposure",
+            "term_role": "household_share_interaction",
+            "household_exposure": "WH2M",
+            "baseline_household_type": "Ricardian",
+            "term_note": (
+                "Interaction of mp_shock with lagged WH2M state share; Ricardian "
+                "share interaction is the omitted baseline."
+            ),
+        }
+    return {
+        "term_label": term,
+        "term_role": "other",
+        "household_exposure": "",
+        "baseline_household_type": "Ricardian" if with_time_fe else "",
+        "term_note": "",
+    }
+
+
+def _plus_months(dates: pd.Series, months: int) -> pd.Series:
+    return dates + pd.offsets.DateOffset(months=months)
+
+
+def _identification_diagnostic(
+    reg_df: pd.DataFrame,
+    fit,
+    response_type: str,
+    horizon: int,
+    spec: str,
+    with_time_fe: bool,
+) -> dict[str, object]:
+    nonzero = reg_df.loc[reg_df["mp_shock"].abs().gt(1e-12)].copy()
+    if nonzero.empty:
+        identifying_dates: list[str] = []
+        identifying_rows = nonzero
+    else:
+        month_variation = (
+            nonzero.groupby("date_str")
+            .agg(
+                ph2m_unique=("lag1_share_PH2M", "nunique"),
+                wh2m_unique=("lag1_share_WH2M", "nunique"),
+            )
+            .reset_index()
+        )
+        identifying_dates = month_variation.loc[
+            month_variation["ph2m_unique"].gt(1)
+            | month_variation["wh2m_unique"].gt(1),
+            "date_str",
+        ].tolist()
+        identifying_rows = nonzero.loc[nonzero["date_str"].isin(identifying_dates)].copy()
+
+    outcome_dates = _plus_months(reg_df["date"], horizon)
+    identifying_outcome_dates = (
+        _plus_months(identifying_rows["date"], horizon)
+        if not identifying_rows.empty
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    includes_2020_outcomes = bool(
+        not identifying_outcome_dates.empty
+        and identifying_outcome_dates.dt.year.ge(2020).any()
+    )
+    average_shock_note = (
+        "Average mp_shock level effect is absorbed by month fixed effects; "
+        "mp_shock x lagged household-share interactions remain identified from "
+        "cross-state exposure variation."
+        if with_time_fe
+        else (
+            "No month fixed effects; mp_shock is reported as the omitted "
+            "Ricardian-share baseline level effect alongside share interactions."
+        )
+    )
+    return {
+        "response_type": response_type,
+        "horizon": horizon,
+        "spec": spec,
+        "n_obs": int(fit.nobs),
+        "n_states": int(reg_df["uf_code"].nunique()),
+        "n_months": int(reg_df["date_str"].nunique()),
+        "sample_min_date": reg_df["date"].min().strftime("%Y-%m"),
+        "sample_max_date": reg_df["date"].max().strftime("%Y-%m"),
+        "outcome_min_date": outcome_dates.min().strftime("%Y-%m"),
+        "outcome_max_date": outcome_dates.max().strftime("%Y-%m"),
+        "nonzero_shock_months": int(nonzero["date_str"].nunique()),
+        "identifying_nonzero_shock_months": len(identifying_dates),
+        "identifying_nonzero_shock_dates": ";".join(identifying_dates),
+        "includes_2020_outcomes": includes_2020_outcomes,
+        "with_time_fe": with_time_fe,
+        "mp_shock_level_identified": not with_time_fe,
+        "interaction_terms_identified": len(identifying_dates) > 0,
+        "note": average_shock_note,
+    }
+
+
 def run_local_projections(
     panel: pd.DataFrame,
     max_horizon: int,
     include_time_fe: bool = True,
-    shock_direction: str = "negative",
+    shock_direction: str = "both",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     specs = _spec_definitions(include_time_fe=include_time_fe)
-    shock_meta = _shock_metadata(shock_direction)
-    shock_multiplier = float(shock_meta["shock_multiplier"])
+    shock_metas = [_shock_metadata(direction) for direction in _selected_shock_directions(shock_direction)]
     records: list[dict[str, object]] = []
     diagnostics: list[dict[str, object]] = []
     for response_type in RESPONSE_TYPES:
@@ -557,62 +731,45 @@ def run_local_projections(
                     )
                 fit = _fit_one_lp(reg_df, str(spec_def["formula"]))
                 with_time_fe = bool(spec_def["with_time_fe"])
-                if with_time_fe:
-                    diagnostics.append(
-                        {
-                            "response_type": response_type,
-                            "horizon": horizon,
-                            "spec": spec,
-                            "n_obs": int(fit.nobs),
-                            "n_states": int(reg_df["uf_code"].nunique()),
-                            "n_months": int(reg_df["date_str"].nunique()),
-                            "mp_shock_identified": False,
-                            "note": (
-                                "mp_shock is common across states within month and is "
-                                "exactly absorbed by month fixed effects."
-                            ),
-                        }
+                diagnostics.append(
+                    _identification_diagnostic(
+                        reg_df,
+                        fit,
+                        response_type=response_type,
+                        horizon=horizon,
+                        spec=spec,
+                        with_time_fe=with_time_fe,
                     )
-                for term in ["mp_shock", "share_PH2M", "share_WH2M"]:
-                    identified = not (with_time_fe and term == "mp_shock")
-                    note = ""
-                    if identified:
-                        estimate = float(fit.params.get(term, np.nan))
-                        std_error = float(fit.bse.get(term, np.nan))
-                        if term == "mp_shock":
-                            estimate *= shock_multiplier
-                        conf_low = estimate - 1.96 * std_error
-                        conf_high = estimate + 1.96 * std_error
-                        if np.isnan(estimate):
-                            identified = False
-                            note = "Term not present in fitted model."
-                    else:
-                        estimate = np.nan
-                        std_error = np.nan
-                        conf_low = np.nan
-                        conf_high = np.nan
-                        note = (
-                            "Not identified: common monthly shock is collinear with "
-                            "month fixed effects."
+                )
+                for term in spec_def["reported_terms"]:
+                    raw_estimate = float(fit.params.get(term, np.nan))
+                    std_error = float(fit.bse.get(term, np.nan))
+                    identified = not np.isnan(raw_estimate)
+                    note = "" if identified else "Term not present in fitted model."
+                    for shock_meta in shock_metas:
+                        shock_multiplier = float(shock_meta["shock_multiplier"])
+                        estimate = raw_estimate * shock_multiplier if identified else np.nan
+                        conf_low = estimate - 1.96 * std_error if identified else np.nan
+                        conf_high = estimate + 1.96 * std_error if identified else np.nan
+                        records.append(
+                            {
+                                "response_type": response_type,
+                                **shock_meta,
+                                "spec": spec,
+                                "with_time_fe": with_time_fe,
+                                "horizon": horizon,
+                                "term": term,
+                                **_term_metadata(term, with_time_fe=with_time_fe),
+                                "estimate": estimate,
+                                "std_error": std_error if identified else np.nan,
+                                "conf_low": conf_low,
+                                "conf_high": conf_high,
+                                "n_obs": int(fit.nobs),
+                                "n_states": int(reg_df["uf_code"].nunique()),
+                                "identified": identified,
+                                "note": note,
+                            }
                         )
-                    records.append(
-                        {
-                            "response_type": response_type,
-                            **shock_meta,
-                            "spec": spec,
-                            "with_time_fe": with_time_fe,
-                            "horizon": horizon,
-                            "term": term,
-                            "estimate": estimate,
-                            "std_error": std_error,
-                            "conf_low": conf_low,
-                            "conf_high": conf_high,
-                            "n_obs": int(fit.nobs),
-                            "n_states": int(reg_df["uf_code"].nunique()),
-                            "identified": identified,
-                            "note": note,
-                        }
-                    )
 
     irf = pd.DataFrame(records)
     expected = pd.MultiIndex.from_product(
@@ -632,11 +789,10 @@ def run_state_local_projections(
     panel: pd.DataFrame,
     max_horizon: int,
     response_types: tuple[str, ...] = ("cumulative",),
-    shock_direction: str = "negative",
+    shock_direction: str = "both",
 ) -> pd.DataFrame:
     specs = _state_spec_definitions()
-    shock_meta = _shock_metadata(shock_direction)
-    shock_multiplier = float(shock_meta["shock_multiplier"])
+    shock_metas = [_shock_metadata(direction) for direction in _selected_shock_directions(shock_direction)]
     records: list[dict[str, object]] = []
     for response_type in response_types:
         if response_type not in RESPONSE_TYPES:
@@ -649,29 +805,42 @@ def run_state_local_projections(
                     if reg_df.empty:
                         continue
                     fit = _fit_one_state_lp(reg_df, str(spec_def["formula"]))
-                    estimate = float(fit.params.get("mp_shock", np.nan)) * shock_multiplier
+                    raw_estimate = float(fit.params.get("mp_shock", np.nan))
                     std_error = float(fit.bse.get("mp_shock", np.nan))
                     state_name = str(reg_df["state_name"].iloc[0])
                     macro_region = str(reg_df["macro_region"].iloc[0])
-                    records.append(
-                        {
-                            "response_type": response_type,
-                            **shock_meta,
-                            "spec": spec,
-                            "uf_code": int(uf_code),
-                            "state_name": state_name,
-                            "macro_region": macro_region,
-                            "horizon": horizon,
-                            "term": "mp_shock",
-                            "estimate": estimate,
-                            "std_error": std_error,
-                            "conf_low": estimate - 1.96 * std_error,
-                            "conf_high": estimate + 1.96 * std_error,
-                            "n_obs": int(fit.nobs),
-                            "identified": not np.isnan(estimate),
-                            "se_type": "HC1",
-                        }
-                    )
+                    for shock_meta in shock_metas:
+                        shock_multiplier = float(shock_meta["shock_multiplier"])
+                        estimate = raw_estimate * shock_multiplier
+                        identified = not np.isnan(estimate)
+                        records.append(
+                            {
+                                "response_type": response_type,
+                                **shock_meta,
+                                "spec": spec,
+                                "uf_code": int(uf_code),
+                                "state_name": state_name,
+                                "macro_region": macro_region,
+                                "horizon": horizon,
+                                "term": "mp_shock",
+                                "term_label": "State-level shock response",
+                                "term_role": "descriptive_state_irf",
+                                "household_exposure": "",
+                                "baseline_household_type": "",
+                                "term_note": (
+                                    "Descriptive state-level spatial IRF; not a "
+                                    "household-type IRF."
+                                ),
+                                "estimate": estimate,
+                                "std_error": std_error if identified else np.nan,
+                                "conf_low": estimate - 1.96 * std_error if identified else np.nan,
+                                "conf_high": estimate + 1.96 * std_error if identified else np.nan,
+                                "n_obs": int(fit.nobs),
+                                "identified": identified,
+                                "se_type": "HC1",
+                                "note": "Descriptive state-level spatial IRF; not a household-type IRF.",
+                            }
+                        )
 
     state_irf = pd.DataFrame(records)
     if state_irf.empty:
@@ -679,33 +848,116 @@ def run_state_local_projections(
     return state_irf
 
 
-def plot_irf(irf: pd.DataFrame, response_type: str, path: Path) -> None:
-    mp = irf.loc[
-        irf["term"].eq("mp_shock")
+def add_scaled_exposure_effects(
+    irf: pd.DataFrame,
+    share_delta: float = DEFAULT_PLOT_SHARE_DELTA,
+) -> pd.DataFrame:
+    """Add plot-ready effects for a realistic household-share exposure contrast."""
+    if share_delta <= 0:
+        raise ValueError("plot_share_delta must be positive.")
+
+    out = irf.copy()
+    interaction = out["term"].isin(INTERACTION_TERMS)
+    out["plot_share_delta"] = np.where(interaction, share_delta, np.nan)
+    out["plot_share_delta_pp"] = np.where(interaction, share_delta * 100, np.nan)
+    out["plot_estimate"] = np.where(interaction, out["estimate"] * share_delta, np.nan)
+    out["plot_std_error"] = np.where(interaction, out["std_error"] * share_delta, np.nan)
+    out["plot_conf_low"] = np.where(interaction, out["conf_low"] * share_delta, np.nan)
+    out["plot_conf_high"] = np.where(interaction, out["conf_high"] * share_delta, np.nan)
+    out["plot_effect_label"] = np.where(
+        interaction,
+        f"log response for +{share_delta * 100:g} pp household-share exposure",
+        "",
+    )
+    return out
+
+
+def plot_irf(
+    irf: pd.DataFrame,
+    response_type: str,
+    path: Path,
+    share_delta: float = DEFAULT_PLOT_SHARE_DELTA,
+) -> None:
+    if "plot_estimate" not in irf.columns:
+        irf = add_scaled_exposure_effects(irf, share_delta=share_delta)
+    hp = irf.loc[
+        irf["term"].isin(INTERACTION_TERMS)
         & irf["identified"]
         & irf["response_type"].eq(response_type)
     ].copy()
-    fig, ax = plt.subplots(figsize=(8, 5))
-    colors = {"lag1": "#1f77b4", "lag2": "#d62728"}
-    for spec, spec_df in mp.groupby("spec"):
-        spec_df = spec_df.sort_values("horizon")
-        x = spec_df["horizon"].to_numpy(dtype=float)
-        estimate = spec_df["estimate"].to_numpy(dtype=float)
-        low = spec_df["conf_low"].to_numpy(dtype=float)
-        high = spec_df["conf_high"].to_numpy(dtype=float)
-        ax.plot(x, estimate, label=spec, color=colors.get(spec))
-        ax.fill_between(x, low, high, color=colors.get(spec), alpha=0.15, linewidth=0)
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("Horizon (months)")
+    preferred = hp.loc[hp["spec"].isin(PREFERRED_SPECS)].copy()
+    if not preferred.empty:
+        hp = preferred
+    terms = [term for term in INTERACTION_TERMS if term in set(hp["term"])]
+    directions = [direction for direction in SHOCK_DIRECTIONS if direction in set(hp["shock_direction"])]
+    if not directions:
+        directions = sorted(hp["shock_direction"].dropna().unique())
+
+    n_rows = max(1, len(terms))
+    n_cols = max(1, len(directions))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.8 * n_cols, 3.2 * n_rows),
+        sharex=True,
+        squeeze=False,
+    )
+    colors = {
+        "lag1_time_fe": "#1f77b4",
+        "lag2_time_fe": "#d62728",
+        "lag1": "#2ca02c",
+        "lag2": "#9467bd",
+    }
     ylabel = (
         "Cumulative log response"
         if response_type == "cumulative"
         else "Marginal monthly log response"
     )
-    ax.set_ylabel(ylabel)
-    shock_label = mp["shock_plot_label"].dropna().iloc[0] if not mp.empty else "MP Shock"
-    ax.set_title(f"State-Month {response_type.title()} LP IRF to {shock_label}")
-    ax.legend(title="Spec")
+    if hp.empty:
+        axes[0, 0].text(0.5, 0.5, "No identified household-exposure IRFs", ha="center")
+        axes[0, 0].set_axis_off()
+    else:
+        for row_idx, term in enumerate(terms):
+            for col_idx, direction in enumerate(directions):
+                ax = axes[row_idx, col_idx]
+                subset = hp.loc[
+                    hp["term"].eq(term) & hp["shock_direction"].eq(direction)
+                ].copy()
+                for spec in [*PREFERRED_SPECS, "lag1", "lag2"]:
+                    spec_df = subset.loc[subset["spec"].eq(spec)].sort_values("horizon")
+                    if spec_df.empty:
+                        continue
+                    x = spec_df["horizon"].to_numpy(dtype=float)
+                    estimate = spec_df["plot_estimate"].to_numpy(dtype=float)
+                    low = spec_df["plot_conf_low"].to_numpy(dtype=float)
+                    high = spec_df["plot_conf_high"].to_numpy(dtype=float)
+                    ax.plot(x, estimate, label=spec, color=colors.get(spec))
+                    ax.fill_between(
+                        x,
+                        low,
+                        high,
+                        color=colors.get(spec),
+                        alpha=0.15,
+                        linewidth=0,
+                    )
+                ax.axhline(0, color="black", linewidth=0.8)
+                ax.set_title(
+                    f"{subset['shock_plot_label'].iloc[0] if not subset.empty else direction}\n"
+                    f"{_term_metadata(term, with_time_fe=True)['household_exposure']} exposure",
+                    fontsize=10,
+                )
+                if row_idx == n_rows - 1:
+                    ax.set_xlabel("Horizon (months)")
+                if col_idx == 0:
+                    ax.set_ylabel(f"{ylabel}\n(+{share_delta * 100:g} pp exposure)")
+                ax.legend(title="Spec", fontsize=8)
+    fig.suptitle(
+        (
+            f"State-Month {response_type.title()} Household-Exposure LP IRFs "
+            f"(+{share_delta * 100:g} pp share)"
+        ),
+        fontsize=13,
+    )
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200)
@@ -720,56 +972,61 @@ def plot_state_region_irfs(state_irf: pd.DataFrame, state_plot_dir: Path) -> lis
     paths: list[Path] = []
     state_plot_dir.mkdir(parents=True, exist_ok=True)
     for response_type in sorted(state_irf["response_type"].unique()):
-        for spec in ["lag1", "lag2"]:
-            subset = state_irf.loc[
-                state_irf["response_type"].eq(response_type)
-                & state_irf["spec"].eq(spec)
-                & state_irf["identified"]
-            ].copy()
-            for region, region_df in subset.groupby("macro_region", sort=False):
-                region_df = region_df.sort_values(["uf_code", "horizon"])
-                states = list(region_df[["uf_code", "state_name"]].drop_duplicates().itertuples(index=False))
-                n_states = len(states)
-                n_cols = 3
-                n_rows = int(np.ceil(n_states / n_cols))
-                fig, axes = plt.subplots(
-                    n_rows,
-                    n_cols,
-                    figsize=(4.2 * n_cols, 2.8 * n_rows),
-                    sharex=True,
-                    sharey=True,
-                )
-                axes_arr = np.atleast_1d(axes).ravel()
-                for ax, state in zip(axes_arr, states):
-                    state_df = region_df.loc[region_df["uf_code"].eq(state.uf_code)]
-                    x = state_df["horizon"].to_numpy(dtype=float)
-                    estimate = state_df["estimate"].to_numpy(dtype=float)
-                    low = state_df["conf_low"].to_numpy(dtype=float)
-                    high = state_df["conf_high"].to_numpy(dtype=float)
-                    ax.plot(x, estimate, color="#1f77b4", linewidth=1.4)
-                    ax.fill_between(x, low, high, color="#1f77b4", alpha=0.14, linewidth=0)
-                    ax.axhline(0, color="black", linewidth=0.7)
-                    ax.set_title(f"{state.state_name} ({state.uf_code})", fontsize=9)
-                    ax.tick_params(labelsize=8)
-                for ax in axes_arr[n_states:]:
-                    ax.set_visible(False)
-                ylabel = (
-                    "Cumulative log response"
-                    if response_type == "cumulative"
-                    else "Marginal monthly log response"
-                )
-                fig.suptitle(
-                    f"{region}: state-level {response_type} IRFs to "
-                    f"{region_df['shock_plot_label'].iloc[0]} ({spec})",
-                    fontsize=13,
-                )
-                fig.supxlabel("Horizon (months)", fontsize=10)
-                fig.supylabel(ylabel, fontsize=10)
-                fig.tight_layout(rect=[0, 0, 1, 0.95])
-                path = state_plot_dir / f"{_slug(response_type)}_{_slug(spec)}_{_slug(region)}.png"
-                fig.savefig(path, dpi=200)
-                plt.close(fig)
-                paths.append(path)
+        for shock_direction in [direction for direction in SHOCK_DIRECTIONS if direction in set(state_irf["shock_direction"])]:
+            for spec in ["lag1", "lag2"]:
+                subset = state_irf.loc[
+                    state_irf["response_type"].eq(response_type)
+                    & state_irf["shock_direction"].eq(shock_direction)
+                    & state_irf["spec"].eq(spec)
+                    & state_irf["identified"]
+                ].copy()
+                for region, region_df in subset.groupby("macro_region", sort=False):
+                    region_df = region_df.sort_values(["uf_code", "horizon"])
+                    states = list(region_df[["uf_code", "state_name"]].drop_duplicates().itertuples(index=False))
+                    n_states = len(states)
+                    n_cols = 3
+                    n_rows = int(np.ceil(n_states / n_cols))
+                    fig, axes = plt.subplots(
+                        n_rows,
+                        n_cols,
+                        figsize=(4.2 * n_cols, 2.8 * n_rows),
+                        sharex=True,
+                        sharey=True,
+                    )
+                    axes_arr = np.atleast_1d(axes).ravel()
+                    for ax, state in zip(axes_arr, states):
+                        state_df = region_df.loc[region_df["uf_code"].eq(state.uf_code)]
+                        x = state_df["horizon"].to_numpy(dtype=float)
+                        estimate = state_df["estimate"].to_numpy(dtype=float)
+                        low = state_df["conf_low"].to_numpy(dtype=float)
+                        high = state_df["conf_high"].to_numpy(dtype=float)
+                        ax.plot(x, estimate, color="#1f77b4", linewidth=1.4)
+                        ax.fill_between(x, low, high, color="#1f77b4", alpha=0.14, linewidth=0)
+                        ax.axhline(0, color="black", linewidth=0.7)
+                        ax.set_title(f"{state.state_name} ({state.uf_code})", fontsize=9)
+                        ax.tick_params(labelsize=8)
+                    for ax in axes_arr[n_states:]:
+                        ax.set_visible(False)
+                    ylabel = (
+                        "Cumulative log response"
+                        if response_type == "cumulative"
+                        else "Marginal monthly log response"
+                    )
+                    fig.suptitle(
+                        f"{region}: descriptive state-level {response_type} IRFs to "
+                        f"{region_df['shock_plot_label'].iloc[0]} ({spec})",
+                        fontsize=13,
+                    )
+                    fig.supxlabel("Horizon (months)", fontsize=10)
+                    fig.supylabel(ylabel, fontsize=10)
+                    fig.tight_layout(rect=[0, 0, 1, 0.95])
+                    path = (
+                        state_plot_dir
+                        / f"{_slug(response_type)}_{_slug(shock_direction)}_{_slug(spec)}_{_slug(region)}.png"
+                    )
+                    fig.savefig(path, dpi=200)
+                    plt.close(fig)
+                    paths.append(path)
     return paths
 
 
@@ -786,16 +1043,18 @@ def write_outputs(
     state_plot_dir: Path,
     summary_out: Path,
     time_fe_diagnostics_out: Path,
+    plot_share_delta: float = DEFAULT_PLOT_SHARE_DELTA,
 ) -> list[Path]:
     for path in [dataset_out, irf_out, state_irf_out, summary_out, time_fe_diagnostics_out]:
         path.parent.mkdir(parents=True, exist_ok=True)
+    irf = add_scaled_exposure_effects(irf, share_delta=plot_share_delta)
     panel.to_csv(dataset_out, index=False)
     irf.to_csv(irf_out, index=False)
     state_irf.to_csv(state_irf_out, index=False)
     summary.to_csv(summary_out, index=False)
     time_fe_diagnostics.to_csv(time_fe_diagnostics_out, index=False)
-    plot_irf(irf, "cumulative", plot_dir / "cumulative_irf.png")
-    plot_irf(irf, "marginal", plot_dir / "marginal_irf.png")
+    plot_irf(irf, "cumulative", plot_dir / "cumulative_irf.png", share_delta=plot_share_delta)
+    plot_irf(irf, "marginal", plot_dir / "marginal_irf.png", share_delta=plot_share_delta)
     return plot_state_region_irfs(state_irf, state_plot_dir)
 
 
@@ -830,6 +1089,7 @@ def main() -> None:
         args.state_plot_dir,
         args.summary_out,
         args.time_fe_diagnostics_out,
+        args.plot_share_delta,
     )
 
     min_date, max_date = _date_range_label(panel)

@@ -135,24 +135,45 @@ def test_local_projection_outputs_requested_horizons_for_both_specs(tmp_path):
     assert set(irf["response_type"]) == {"cumulative", "marginal"}
     assert set(irf["shock_variable"]) == {"mp_shock"}
     assert set(irf["shock_type"]) == {"Monthly monetary-policy shock from DI surprise"}
-    assert set(irf["shock_direction"]) == {"negative signed shock"}
-    assert set(irf["shock_unit"]) == {
-        "one-unit decrease in mp_shock; source mp_shock values are sign-flipped for this reported IRF"
+    assert set(irf["shock_direction"]) == {
+        "contractionary_rate_surprise",
+        "expansionary_rate_surprise",
     }
-    assert set(irf["shock_multiplier"]) == {-1.0}
+    assert set(irf["shock_unit"]) == {
+        "one-unit positive DI/rate surprise; positive mp_shock is contractionary",
+        "one-unit negative DI/rate surprise; source mp_shock values are sign-flipped for this reported IRF",
+    }
+    assert set(irf["shock_multiplier"]) == {-1.0, 1.0}
     assert set(irf["horizon"]) == {0, 1, 2}
-    assert set(irf["term"]) == {"mp_shock", "share_PH2M", "share_WH2M"}
-    base_mp = irf.loc[
-        irf["term"].eq("mp_shock") & irf["spec"].isin(["lag1", "lag2"])
-    ]
+    assert set(irf["term"]) == {
+        "mp_shock",
+        "mp_shock_x_share_PH2M",
+        "mp_shock_x_share_WH2M",
+    }
+    assert {
+        "Shock x lagged PH2M share exposure",
+        "Shock x lagged WH2M share exposure",
+    }.issubset(set(irf["term_label"]))
+    base_mp = irf.loc[irf["term"].eq("mp_shock") & irf["spec"].isin(["lag1", "lag2"])]
     assert not base_mp["estimate"].isna().any()
-    time_fe_mp = irf.loc[
-        irf["term"].eq("mp_shock") & irf["spec"].str.endswith("_time_fe")
+    assert not (
+        irf["term"].isin(["share_PH2M", "share_WH2M"])
+        & irf["term_role"].eq("household_share_interaction")
+    ).any()
+    time_fe_interactions = irf.loc[
+        irf["term"].isin(["mp_shock_x_share_PH2M", "mp_shock_x_share_WH2M"])
+        & irf["spec"].str.endswith("_time_fe")
     ]
-    assert time_fe_mp["estimate"].isna().all()
-    assert not time_fe_mp["identified"].any()
+    assert not time_fe_interactions["estimate"].isna().any()
+    assert time_fe_interactions["identified"].all()
     assert not diagnostics.empty
-    assert not diagnostics["mp_shock_identified"].any()
+    assert {"sample_min_date", "sample_max_date", "nonzero_shock_months"}.issubset(
+        diagnostics.columns
+    )
+    assert not diagnostics.loc[
+        diagnostics["spec"].str.endswith("_time_fe"), "mp_shock_level_identified"
+    ].any()
+    assert diagnostics["interaction_terms_identified"].any()
 
 
 def test_marginal_response_uses_horizon_to_horizon_log_change(tmp_path):
@@ -186,18 +207,43 @@ def test_negative_shock_irf_sign_flips_positive_orientation(tmp_path):
         panel,
         max_horizon=2,
         include_time_fe=False,
-        shock_direction="positive",
+        shock_direction="contractionary_rate_surprise",
     )
     negative, _ = lp.run_local_projections(
         panel,
         max_horizon=2,
         include_time_fe=False,
-        shock_direction="negative",
+        shock_direction="expansionary_rate_surprise",
     )
-    pos_mp = positive.loc[positive["term"].eq("mp_shock"), "estimate"].to_numpy()
-    neg_mp = negative.loc[negative["term"].eq("mp_shock"), "estimate"].to_numpy()
+    pos_mp = positive.sort_values(["response_type", "spec", "horizon", "term"])[
+        "estimate"
+    ].to_numpy()
+    neg_mp = negative.sort_values(["response_type", "spec", "horizon", "term"])[
+        "estimate"
+    ].to_numpy()
 
     assert np.allclose(neg_mp, -pos_mp)
+
+
+def test_scaled_exposure_effects_use_share_delta(tmp_path):
+    consumption_path, htm_path, shock_path = _synthetic_inputs(tmp_path, n_months=8)
+    panel, _ = lp.build_matched_panel(
+        lp.read_consumption(consumption_path),
+        lp.read_htm_shares(htm_path),
+        lp.read_shocks(shock_path),
+    )
+
+    irf, _ = lp.run_local_projections(panel, max_horizon=2)
+    scaled = lp.add_scaled_exposure_effects(irf, share_delta=0.10)
+    interaction = scaled["term"].isin(["mp_shock_x_share_PH2M", "mp_shock_x_share_WH2M"])
+
+    assert scaled.loc[interaction, "plot_share_delta_pp"].eq(10).all()
+    assert np.allclose(
+        scaled.loc[interaction, "plot_estimate"],
+        scaled.loc[interaction, "estimate"] * 0.10,
+        equal_nan=True,
+    )
+    assert scaled.loc[~interaction, "plot_estimate"].isna().all()
 
 
 def test_state_level_irfs_and_region_panels_are_written(tmp_path):
@@ -219,6 +265,12 @@ def test_state_level_irfs_and_region_panels_are_written(tmp_path):
     assert set(state_irf["spec"]) == {"lag1", "lag2"}
     assert set(state_irf["horizon"]) == {0, 1, 2}
     assert set(state_irf["term"]) == {"mp_shock"}
+    assert set(state_irf["term_role"]) == {"descriptive_state_irf"}
+    assert state_irf["household_exposure"].fillna("").eq("").all()
+    assert set(state_irf["shock_direction"]) == {
+        "contractionary_rate_surprise",
+        "expansionary_rate_surprise",
+    }
     assert {"North"}.issubset(set(state_irf["macro_region"]))
     assert paths
     assert all(path.exists() and path.stat().st_size > 0 for path in paths)
