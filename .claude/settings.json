@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "afplay \"/Users/kai/.claude/audio/mario-_it's-a-me,-mario!_-made-with-Voicemod.mp3\"",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FRONTMOST=$(osascript -e 'tell application \"System Events\" to get name of first application process whose frontmost is true' 2>/dev/null); case \"$FRONTMOST\" in Terminal|iTerm2|iTerm|Hyper|Alacritty|WezTerm|kitty|Ghostty) ;; *) afplay \"/Users/kai/Desktop/imHANKingit/Voicy_YAHOO.mp3\" ;; esac",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

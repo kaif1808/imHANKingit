@@ -1,0 +1,3 @@
+name,left_rows,right_rows,merged_rows,left_only,right_only,validate
+state_quarterly_plus_htm,648,648,648,0,0,1:1
+state_quarterly_plus_shock,648,78,648,0,0,m:1
