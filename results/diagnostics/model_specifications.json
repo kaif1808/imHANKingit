@@ -1,0 +1,53 @@
+{
+  "state_level": {
+    "outcome_transform": "log(consumption_index)",
+    "response": "log(y_{t+h}) - log(y_{t-1})",
+    "horizons_quarterly": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20
+    ],
+    "controls": [
+      "share_PH2M",
+      "share_WH2M",
+      "lag_log_y",
+      "lag_shock"
+    ],
+    "fixed_effects": [
+      "state",
+      "time"
+    ],
+    "inference_primary": "driscoll-kraay (PanelOLS) or clustered fallback",
+    "state_specific_inference": "newey-west HAC",
+    "shock_scaling": "\u00b11 sd of quarterly shock"
+  },
+  "shock_aggregation": {
+    "monthly_from": "DISurprise",
+    "quarterly_rule": "sum(monthly shocks in quarter)"
+  },
+  "part2": {
+    "status": "gated by availability of individual consumption and month key",
+    "clustered_se": [
+      "individual",
+      "state"
+    ]
+  }
+}

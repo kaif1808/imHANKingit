@@ -1,0 +1,17 @@
+---
+title: "IRF heterogeneity synthesis"
+format: html
+---
+
+## Scope
+This report compares cumulative IRFs across state and individual levels, frequencies, and agent types.
+
+## Execution status
+- Part 2 not executed due to missing individual consumption/month keys.
+- State-level quarterly IRFs were estimated for horizons 0 to 20.
+
+## Output files
+- `results/tables/irf_state_level/*`
+- `results/plots/irf_state_level/*`
+- `results/tables/irf_master_results.parquet`
+- `results/diagnostics/*`
