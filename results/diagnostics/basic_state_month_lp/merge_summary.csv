@@ -1,0 +1,6 @@
+source,row_count,min_date,max_date,n_states,dropped_from_previous,note
+consumption_long,2700,2012-01,2020-04,27.0,,
+htm_shares,4536,2012-01,2025-12,27.0,,
+shocks,231,2005-02,2024-04,,,
+consumption_htm_inner,2700,2012-01,2020-04,27.0,0.0,"Inner join on uf_code, year, month."
+fully_matched,2700,2012-01,2020-04,27.0,0.0,"Inner joined shocks on year, month, then dropped rows missing consumption, shock, or HtM shares."

@@ -14,10 +14,12 @@ It is intended as a reproducibility map, not a source-code specification.
 | Artifact family | Producer script | Minimal inputs | Re-run command |
 | --- | --- | --- | --- |
 | `results/tables/pof_bin_shares.csv` | `htm_classification.py` | POF fixed-width tables in `Data/Dados_20230713/` + dictionary workbook `Data/Documentacao_20230713/Dicionarios de variaveis.xls` | `python3 htm_classification.py --no-choropleth` |
-| `results/tables/state_quarter_htm_shares.csv` | `htm_classification.py` | Same as above + PNADC parquet (`PNAD-C-Treated/pnad_matched.parquet` by default, or `--pnad-parquet`) | `python3 htm_classification.py --no-choropleth` |
-| `results/tables/individual_agent_types.parquet` | `htm_classification.py` | Same as above | `python3 htm_classification.py --no-choropleth` |
+| `results/tables/state_month_htm_shares.parquet` | `htm_classification.py` | Same as above + monthly PNADC parquet (`pnadc_matched_with_periods.parquet` by default, or `--pnad-parquet`) | `python3 htm_classification.py --no-choropleth` |
+| `results/tables/state_month_htm_shares_mc.parquet` | `htm_classification.py` | Same as above | `python3 htm_classification.py --no-choropleth` |
+| `results/diagnostics/monthly_htm_coverage.csv` | `htm_classification.py` | Same as above | `python3 htm_classification.py --no-choropleth` |
+| `results/tables/state_quarter_htm_shares.csv` | `htm_classification.py` | Monthly expected output aggregated to quarters; legacy compatibility output unless `--no-legacy-quarterly` is used | `python3 htm_classification.py --no-choropleth` |
 | `results/plots/choropleth_htm_YYYYQq.png` | `htm_classification.py` (step 6) or `generate_choropleths.py` | `results/tables/state_quarter_htm_shares.csv` + IBGE shapefile download at runtime | `python3 generate_choropleths.py --input results/tables/state_quarter_htm_shares.csv --output-dir results/plots` |
-| `results/datasets/state_monthly_covariates.csv` | `cumulative_irf_heterogeneity.py` | `results/tables/state_quarter_htm_shares.csv` + `results/tables/aggregate_state_monthly_shock_h2m.csv` | `python3 cumulative_irf_heterogeneity.py` |
+| `results/datasets/state_monthly_covariates.csv` | `cumulative_irf_heterogeneity.py` | `results/tables/state_month_htm_shares.parquet` + `results/tables/aggregate_state_monthly_shock_h2m.csv`; falls back to `state_quarter_htm_shares.csv` interpolation if the monthly parquet is absent | `python3 cumulative_irf_heterogeneity.py` |
 | `results/tables/irf_state_level/irf_state_pooled_monthly.csv` | `cumulative_irf_heterogeneity.py` | Same as above | `python3 cumulative_irf_heterogeneity.py` |
 | `results/tables/irf_state_level/irf_state_pooled_type_irfs.csv` | `cumulative_irf_heterogeneity.py` | Same as above | `python3 cumulative_irf_heterogeneity.py` |
 | `results/tables/irf_state_level/irf_state_by_state_monthly.csv` | `cumulative_irf_heterogeneity.py` | Same as above | `python3 cumulative_irf_heterogeneity.py` |

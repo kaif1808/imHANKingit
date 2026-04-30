@@ -74,3 +74,5 @@ Voicy_YAHOO.mp3
 results/tables/individual_agent_types.parquet
 untitled:plan-cumulativeIrfHeterogeneity.prompt.md
 pnad_matched.parquet
+pnadc_matched.parquet
+pnadc_matched_with_periods.parquet
