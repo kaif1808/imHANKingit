@@ -9,4 +9,4 @@ savepath;
 
 rehash toolboxcache;
 cd('C:\Users\HP\Desktop\Fiscal Policy\Fiscal Policy\Psets');
-% dynare XX.mod add you file name here with the structural model
+dynare THRANK_LP_comparison.mod
