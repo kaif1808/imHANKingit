@@ -1,111 +1,62 @@
 # PNAD-C Required Variable Inventory
 
-This document lists all PNAD-C columns referenced by `htm_classification.py` for the PNAD-C stage of the pipeline.
+This document lists the PNAD-C columns referenced by `htm_classification.py` for the streamed monthly parquet stage.
 
-## Variables used in both schema variants
+## Canonical Monthly Parquet
 
-These are referenced regardless of whether the file is in pretreated (DataZoom-like) or raw PNAD-C format.
+The default input is `pnadc_matched_with_periods.parquet` in the repository root, or another file passed with `--pnad-parquet`.
 
-| Variable | Required? | Where used |
-|---|---|---|
-| `UF` | Yes | Converted to `uf_code`, then mapped to macro-region bins and used for state-level aggregation. |
-| `Ano` | Yes | Converted to `year`; also used in household-size grouping for pretreated data. |
-| `Trimestre` | Yes | Converted to `quarter`; also used in household-size grouping for pretreated data and reporting. |
-
-## Pretreated format (`test5.csv`, `test6.csv`, `test7.csv`)
-
-Activated when `faixa_idade` exists and `V2009` does not.
+The pipeline reads the parquet with `pyarrow.parquet.ParquetFile.iter_batches(...)` and selects only the columns needed for monthly aggregation and diagnostics.
 
 ### Required input columns
 
 | Variable | Required? | Where used |
 |---|---|---|
-| `faixa_idade` | Yes | Converted to numeric age (`age`) for age filter and age-group binning. |
-| `sexo` | Yes | Mapped to `sex_code` (`Homem`/`Mulher`) for gender binning. |
-| `faixa_educ` | Yes | Converted to `vd3004` proxy for education-group binning. |
-| `Habitual` | Yes | Used as survey weight (`weight`) for weighted shares and aggregation. |
-| `rendimento_habitual_real` | Yes | Used as labor income proxy (`rendimento`) to compute per-capita income. |
-| `ID_DOMICILIO` | Yes | Used with `Ano` and `Trimestre` to infer household size (`hh_size`) by count. |
+| `UF` | Yes | Converted to `uf_code`, mapped to macro-region bins, and used for state-month aggregation. |
+| `V2009` | Yes | Raw age, used for the age >= 15 filter and age-group binning. |
+| `V2007` | Yes | Raw sex code, used for gender binning. |
+| `VD3004` | Yes | Raw education code, used for education-group binning. |
+| `V2001` | Yes | Raw household size, used to compute per-capita income. |
+| `rendimento_habitual_real` | Yes | Raw habitual real income, used to compute per-capita income. |
+| `ref_month_yyyymm` | Yes | Monthly period key used for `year`, `month`, coverage diagnostics, and aggregation. Rows with missing values are excluded from monthly aggregation and counted in diagnostics. |
+| `ref_month_in_year` | Yes | Month number. If invalid, the month is recovered from `ref_month_yyyymm`. |
+| `weight_monthly` | Yes | Monthly survey weight used for all expected and Monte Carlo weighted shares. Rows with missing values are excluded from monthly aggregation and counted in diagnostics. |
 
-### Conditionally used input columns (labor-status refinement)
+### Required identifier availability
 
-These are not strictly mandatory in code (missing columns are skipped), but they materially affect labor-status classification and therefore bin matching quality.
-
-| Variable | Required? | Where used |
-|---|---|---|
-| `formal` | Conditional | If present, `formal == 1` classifies worker as formal. |
-| `conta_propria` | Conditional | If present, `conta_propria == 1` classifies worker as self-employed. |
-| `informal` | Conditional | If present, helps classify worker as informal. |
-| `ocupado` | Conditional | If present, `ocupado == 1` also triggers informal classification fallback. |
-| `desocupado` | Conditional | If present, `desocupado == 1` classifies worker as unemployed. |
-| `fora_forca_trab` | Conditional/read-only | Coerced if present, but not directly read in classifier logic; useful for upstream consistency. |
-
-### Derived columns (not required in source file)
-
-`year`, `quarter`, `uf_code`, `age`, `sex_code`, `vd3004`, `weight`, `rendimento`, `hh_size`, `pc_income_pnadc`, `macro_region`, `age_group`, `gender`, `education_group`, `labor_status`, `pc_income_quintile`, `bin_key`.
-
-### Minimal pretreated input checklist
-
-- `UF`
-- `Ano`
-- `Trimestre`
-- `faixa_idade`
-- `sexo`
-- `faixa_educ`
-- `Habitual`
-- `rendimento_habitual_real`
-- `ID_DOMICILIO`
-- Recommended for labor quality: `formal`, `conta_propria`, `informal`, `ocupado`, `desocupado`, `fora_forca_trab`
-
-## Raw PNAD-C panel format
-
-Activated when `V2009` exists (or `faixa_idade` is absent).
-
-### Required input columns
+At least one of these must be present:
 
 | Variable | Required? | Where used |
 |---|---|---|
-| `V2009` | Yes | Age (`age`) for age filter and age-group binning. |
-| `V2007` | Yes | Sex code (`sex_code`) for gender binning. |
-| `VD3004` | Yes | Education code (`vd3004`) for education-group binning. |
-| `V1028` | Yes | Survey weight (`weight`) for weighted shares and aggregation. |
-| `V2001` | Yes | Household size (`hh_size`) for per-capita income computation. |
+| `id_rs` | Preferred | Stable panel identifier for deterministic Monte Carlo draws. |
+| `id_ind` | Fallback | Used for deterministic Monte Carlo draws when `id_rs` is missing. |
 
-### Optional but used if present
+Rows with missing `id_rs` must have non-missing `id_ind`.
 
-| Variable | Required? | Where used |
-|---|---|---|
-| `rendimento_habitual_real` | Optional | Read via `pnadc.get(...)`; if absent, defaults to `NaN` then 0. |
+### Optional labor-status columns
 
-### Conditionally used input columns (labor-status refinement)
+These improve bin matching quality when present. Missing columns default to zero and therefore classify through the remaining available indicators.
 
 | Variable | Required? | Where used |
 |---|---|---|
-| `formal` | Conditional | If present, `formal == 1` classifies worker as formal. |
-| `conta_propria` | Conditional | If present, `conta_propria == 1` classifies worker as self-employed. |
-| `informal` | Conditional | If present, helps classify worker as informal. |
-| `ocupado` | Conditional | If present, `ocupado == 1` also triggers informal classification fallback. |
-| `desocupado` | Conditional | If present, `desocupado == 1` classifies worker as unemployed. |
-| `fora_forca_trab` | Conditional/read-only | Coerced if present, but not directly read in classifier logic; useful for upstream consistency. |
+| `formal` | Optional | `formal == 1` classifies worker as formal. |
+| `conta_propria` | Optional | `conta_propria == 1` classifies worker as self-employed. |
+| `informal` | Optional | Helps classify worker as informal. |
+| `ocupado` | Optional | Also triggers informal classification fallback. |
+| `desocupado` | Optional | `desocupado == 1` classifies worker as unemployed. |
+| `fora_forca_trab` | Optional | Read for schema continuity; current classifier otherwise defaults unassigned rows to inactive. |
 
-### Derived columns (not required in source file)
+### Ignored legacy/pretreated columns
 
-`year`, `quarter`, `uf_code`, `age`, `sex_code`, `vd3004`, `weight`, `rendimento`, `hh_size`, `pc_income_pnadc`, `macro_region`, `age_group`, `gender`, `education_group`, `labor_status`, `pc_income_quintile`, `bin_key`.
+The monthly parquet may contain `faixa_idade`, `sexo`, `faixa_educ`, `Habitual`, and `V1028`, but the monthly pipeline intentionally uses the raw PNADC columns listed above. In particular, monthly aggregation uses `weight_monthly`, not `V1028` or `Habitual`.
 
-### Minimal raw-format input checklist
+## Derived columns
 
-- `UF`
-- `Ano`
-- `Trimestre`
-- `V2009`
-- `V2007`
-- `VD3004`
-- `V1028`
-- `V2001`
-- Optional: `rendimento_habitual_real`
-- Recommended for labor quality: `formal`, `conta_propria`, `informal`, `ocupado`, `desocupado`, `fora_forca_trab`
+`year`, `month`, `uf_code`, `age`, `sex_code`, `vd3004`, `pc_income_pnadc`, `macro_region`, `age_group`, `gender`, `education_group`, `labor_status`, `pc_income_quintile`, `bin_key`, `p_ph2m`, `p_wh2m`, `p_ric`, and deterministic `agent_type` are derived inside `htm_classification.py`.
 
-## Notes on strictness
+## Outputs
 
-- The script will fail if required columns in each branch are missing.
-- Labor-status columns are treated permissively in code, but missing them reduces labor-status granularity and! may worsen POF-to-PNAD-C bin alignment.
+- `results/tables/state_month_htm_shares.parquet`: canonical expected probability-weighted state-month shares.
+- `results/tables/state_month_htm_shares_mc.parquet`: deterministic Monte Carlo diagnostic state-month shares.
+- `results/diagnostics/monthly_htm_coverage.csv`: coverage, exclusion, unmatched-bin, weight, and national monthly share diagnostics.
+- `results/tables/state_quarter_htm_shares.csv`: optional legacy quarterly aggregate, written unless `--no-legacy-quarterly` is used.

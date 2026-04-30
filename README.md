@@ -8,11 +8,14 @@ Starting from the POF 2017-18 household budget survey (fixed-width text tables),
 - WH2M: Wealthy Hand-to-Mouth (low liquid, high illiquid assets)
 - Ricardian: sufficient liquid buffer to smooth consumption
 
-The resulting type shares are transferred to the PNADC quarterly labour-force survey via demographic bin construction, merge, and a Monte Carlo assignment step, producing a state x quarter panel of type shares suitable for HANK calibration.
+The resulting type shares are transferred to the PNADC monthly matched labour-force panel via demographic bin construction and probability matching, producing canonical state x month expected HtM shares. A deterministic Monte Carlo state-month series is also produced as a diagnostic.
 
 ## What the pipeline produces
 - `results/tables/pof_bin_shares.csv`: weighted PH2M/WH2M/Ricardian shares by demographic bins (with Dirichlet smoothing).
-- `results/tables/state_quarter_htm_shares.csv`: population-weighted agent-type shares by UF (state) and quarter.
+- `results/tables/state_month_htm_shares.parquet`: population-weighted expected agent-type shares by UF (state) and month.
+- `results/tables/state_month_htm_shares_mc.parquet`: deterministic Monte Carlo diagnostic shares by UF and month.
+- `results/diagnostics/monthly_htm_coverage.csv`: monthly coverage, exclusion, unmatched-bin, and national-share diagnostics.
+- `results/tables/state_quarter_htm_shares.csv`: legacy state-quarter shares aggregated from the monthly expected output.
 - `results/plots/choropleth_htm_YYYYQq.png`: four-panel choropleths per quarter (PH2M, WH2M, Total HtM, Ricardian).
 
 ## Directory Layout
@@ -53,6 +56,8 @@ The resulting type shares are transferred to the PNADC quarterly labour-force su
 ├── results/
 │   ├── tables/
 │   │   ├── pof_bin_shares.csv
+│   │   ├── state_month_htm_shares.parquet
+│   │   ├── state_month_htm_shares_mc.parquet
 │   │   ├── state_quarter_htm_shares.csv
 │   │   └── irf_*.csv
 │   ├── plots/
@@ -107,8 +112,8 @@ The resulting type shares are transferred to the PNADC quarterly labour-force su
 - The current Python pipeline uses the treated CSVs in `PNAD-C-Treated/` as inputs.
 
 `PNAD-C-Treated/`
-- Pre-filtered and derived PNADC CSVs for the Python pipeline.
-- The main script currently expects `test5.csv`, `test6.csv`, and `test7.csv` (plus optional `pnadc_panel_5/6/7.csv`).
+- Historical location for pre-filtered and derived PNADC extracts.
+- The canonical classification script now defaults to root-level `pnadc_matched_with_periods.parquet`; pass `--pnad-parquet` for another monthly matched parquet.
 
 `results/`
 - Canonical destination for generated artifacts to keep repo root clean.
@@ -136,15 +141,18 @@ The resulting type shares are transferred to the PNADC quarterly labour-force su
 
 ### Key scripts and notebooks
 `htm_classification.py`
-- End-to-end pipeline: POF classification -> demographic bin shares -> PNADC merge -> Monte Carlo assignment -> state x quarter shares -> optional choropleths.
-- Note: `BASE_DIR` is currently hardcoded to a local path inside this repo.
+- End-to-end pipeline: POF classification -> demographic bin shares -> streamed PNADC parquet batches -> state x month expected shares -> Monte Carlo diagnostic shares -> optional legacy quarterly choropleths.
+- Note: paths are resolved relative to the repository root containing `htm_classification.py`.
 - Default output locations:
   - `results/tables/pof_bin_shares.csv`
-  - `results/tables/state_quarter_htm_shares.csv`
+  - `results/tables/state_month_htm_shares.parquet`
+  - `results/tables/state_month_htm_shares_mc.parquet`
+  - `results/diagnostics/monthly_htm_coverage.csv`
+  - `results/tables/state_quarter_htm_shares.csv` (legacy aggregate)
   - `results/plots/choropleth_htm_YYYYQq.png`
 
 `generate_choropleths.py`
-- Generates per-quarter choropleth figures from `results/tables/state_quarter_htm_shares.csv` (downloads IBGE state boundaries).
+- Generates per-quarter choropleth figures from the legacy `results/tables/state_quarter_htm_shares.csv` aggregate (downloads IBGE state boundaries).
 - Default output directory: `results/plots/`.
 
 `scripts/utils/convert_report_to_notebook.py` and `scripts/utils/fix_notebook_markdown.py`
@@ -171,8 +179,10 @@ The resulting type shares are transferred to the PNADC quarterly labour-force su
    - `python3 htm_classification.py`
 3. Common flags:
    - Skip choropleths: `python3 htm_classification.py --no-choropleth`
-   - Alternative quintiling: `python3 htm_classification.py --per-quarter-quintiles`
+   - Legacy within-batch PNADC quintiling: `python3 htm_classification.py --per-quarter-quintiles`
+   - Custom monthly matched PNADC parquet: `python3 htm_classification.py --pnad-parquet /path/to/pnadc_matched_with_periods.parquet`
+   - Skip the legacy quarterly CSV: `python3 htm_classification.py --no-legacy-quarterly`
 
 ## Notes
 - Choropleth generation requires `geopandas` and downloads IBGE boundaries at runtime.
-- If you move the repo, update `BASE_DIR` in `htm_classification.py` (the pipeline uses local paths).
+- `cumulative_irf_heterogeneity.py` reads `results/tables/state_month_htm_shares.parquet` directly and falls back to quarterly interpolation only when the monthly parquet is absent.

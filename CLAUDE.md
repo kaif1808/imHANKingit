@@ -4,11 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**ImHANKingIt** is a research pipeline that classifies Brazilian households into Hand-to-Mouth (HtM) agent types following the Kaplan–Violante–Weidner (2014) framework, then transfers those classifications to the PNADC quarterly labor-force survey.
+**ImHANKingIt** is a research pipeline that classifies Brazilian households into Hand-to-Mouth (HtM) agent types following the Kaplan–Violante–Weidner (2014) framework, then transfers those classifications to the PNADC monthly matched labor-force panel.
 
 The pipeline produces:
 - `results/tables/pof_bin_shares.csv` — demographic bin shares by HtM type
-- `results/tables/state_quarter_htm_shares.csv` — state × quarter population-weighted type shares
+- `results/tables/state_month_htm_shares.parquet` — state × month expected probability-weighted type shares
+- `results/tables/state_month_htm_shares_mc.parquet` — state × month deterministic Monte Carlo diagnostic shares
+- `results/diagnostics/monthly_htm_coverage.csv` — monthly coverage and exclusion diagnostics
+- `results/tables/state_quarter_htm_shares.csv` — legacy state × quarter aggregate
 - `results/plots/choropleth_htm_YYYYQq.png` — per-quarter 4-panel regional maps (one per quarter)
 
 ## Architecture
@@ -22,12 +25,12 @@ The pipeline produces:
    - Build demographic bins (6 dimensions: region, age, education, gender, labor status, income quintile)
    - Compute weighted type shares per bin with Dirichlet smoothing
 
-2. **PNADC stage (parquet or CSV):**
-   - Read PNADC (`PNAD-C-Treated/pnad_matched.parquet` by default, or via `--pnad-parquet PATH`)
+2. **PNADC stage (monthly parquet):**
+   - Stream PNADC (`pnadc_matched_with_periods.parquet` by default, or via `--pnad-parquet PATH`) in `pyarrow` batches
    - Build identical demographic bins on PNADC data
-   - Merge POF bin shares onto PNADC records
-   - Monte Carlo assignment: random draw HtM type per record from merged bin shares
-   - Aggregate to state × quarter panel
+   - Merge POF bin probabilities onto PNADC records
+   - Aggregate expected probabilities to state × month shares
+   - Build deterministic Monte Carlo state-month shares as a diagnostic
 
 3. **Visualization (optional):**
    - Generate per-quarter 4-panel choropleths if `--no-choropleth` not set
@@ -35,7 +38,7 @@ The pipeline produces:
 
 ### Configuration & Paths
 
-**Important:** `BASE_DIR` in `htm_classification.py` (line 49) is hardcoded to `/Users/kai/Desktop/imHANKingit`. If the repo is moved, update this path or pass explicit flags.
+Paths in `htm_classification.py` are resolved relative to the repository root containing the script.
 
 Key parameters are set near the top of `htm_classification.py`:
 - `SELIC_RATE` (9% for 2017-18), `LIQUID_THRESH` (0.50), `ILLIQUID_MULT` (3) — agent classification thresholds
@@ -49,14 +52,14 @@ Key parameters are set near the top of `htm_classification.py`:
 - `DOMICILIO.txt`, `MORADOR.txt`, `RENDIMENTO_TRABALHO.txt`, `OUTROS_RENDIMENTOS.txt`, `ALUGUEL_ESTIMADO.txt`
 - Parsed via Excel dictionary for column positions
 
-**PNADC inputs** (parquet):
-- Default: `PNAD-C-Treated/pnad_matched.parquet`
-- Required columns: `UF`, `Ano`, `Trimestre`, `faixa_idade`, `sexo`, `faixa_educ`, `Habitual`, `rendimento_habitual_real`, `ID_DOMICILIO`
+**PNADC inputs** (monthly parquet):
+- Default: `pnadc_matched_with_periods.parquet`
+- Required raw columns: `UF`, `V2009`, `V2007`, `VD3004`, `V2001`, `rendimento_habitual_real`, `ref_month_yyyymm`, `ref_month_in_year`, `weight_monthly`, plus `id_rs` or `id_ind`
 - See `PNADC_REQUIRED_VARIABLES.md` for full variable inventory
 
 **Output tables:**
 - `pof_bin_shares.csv`: columns `[region, age, education, gender, labor_status, income_quintile, PH2M, WH2M, Ricardian, n_weighted, flag]`
-- `state_quarter_htm_shares.csv`: columns `[UF, Ano, Trimestre, PH2M, WH2M, Ricardian, population]`
+- `state_month_htm_shares.parquet`: columns `[uf_code, year, month, ref_month_yyyymm, share_PH2M, share_WH2M, share_Ricardian, share_H2M, total_weight, n_obs, n_unmatched]`
 
 ## Development Commands
 
@@ -73,11 +76,14 @@ python3 htm_classification.py
 # Skip choropleth generation
 python3 htm_classification.py --no-choropleth
 
-# Use per-quarter quintiles instead of POF cut-points (reduces seasonal bias)
+# Legacy within-batch PNADC quintiles instead of POF cut-points
 python3 htm_classification.py --per-quarter-quintiles
 
 # Custom PNADC input
 python3 htm_classification.py --pnad-parquet /path/to/custom.parquet
+
+# Skip legacy quarterly aggregate
+python3 htm_classification.py --no-legacy-quarterly
 ```
 
 ### Tests
@@ -124,17 +130,17 @@ Rscript pnad.r
 
 ## Testing & Validation Notes
 
-- **Quintile alignment:** POF-derived quintile cut-points are used when matching PNADC to bins (not per-PNADC quintiles), ensuring alignment across quarters. Override with `--per-quarter-quintiles` if needed.
+- **Quintile alignment:** POF-derived quintile cut-points are used when matching PNADC to bins (not per-PNADC quintiles), ensuring alignment across months. `--per-quarter-quintiles` is retained as a legacy within-batch option.
 - **Outliers:** PNADC incomes outside the POF range map to Q1 (below minimum) or Q5 (above maximum).
 - **Monte Carlo:** Stochastic assignment uses `RANDOM_SEED=42` for reproducibility.
 - **Dirichlet smoothing:** Bins with `n_weighted < MIN_WEIGHTED_N` are flagged in output; smoothing parameter `ALPHA_SMOOTH` controls strength.
 
 ## Common Issues & Fixes
 
-1. **"pnad_matched.parquet not found"** → Pass `--pnad-parquet /path/to/parquet` or create symlink in `PNAD-C-Treated/`
+1. **"pnadc_matched_with_periods.parquet not found"** → Pass `--pnad-parquet /path/to/parquet`
 2. **Choropleth download fails** → Script falls back gracefully; check network if needed
 3. **Seasonal discontinuity in Ricardian shares** → Try `--per-quarter-quintiles` to reduce seasonal bias
-4. **BASE_DIR hardcoded path mismatch** → Update line 49 in `htm_classification.py` or run from correct directory
+4. **Monthly parquet missing for IRFs** → `cumulative_irf_heterogeneity.py` falls back to quarterly interpolation when `results/tables/state_month_htm_shares.parquet` is absent
 
 ## Dependencies
 
