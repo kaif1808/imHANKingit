@@ -2,6 +2,14 @@
 .cursor/
 .kilocode
 .positai
+# OS / editor junk
+.DS_Store
+**/.DS_Store
+# Python cache files
+__pycache__/
+*.py[cod]
+# Quarto rendered companion folders are generated
+*_files/
 # Python virtual environment
 .venv/
 venv/
