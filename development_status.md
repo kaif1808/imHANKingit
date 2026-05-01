@@ -1,5 +1,28 @@
 # Development Status
 
+## Latest Update — 2026-05-01
+
+### README overhaul: contributor runbook and repository approach
+
+Rewrote the root `README.md` into a full onboarding and execution guide centered on the current monthly PNADC workflow and canonical artifact locations.
+
+**What was done:**
+
+- Replaced the previous README with a task-oriented structure: project overview, quick start, repository approach playbooks, architecture/data-flow, runbook-by-task, testing, troubleshooting, and contribution guardrails.
+- Added a mermaid flowchart documenting the POF -> PNADC -> monthly outputs -> legacy quarterly/maps -> IRF flow.
+- Aligned commands and output paths with current pipeline behavior:
+  - `results/tables/state_month_htm_shares.parquet` as canonical monthly output
+  - `results/tables/state_month_htm_shares_mc.parquet` as deterministic MC diagnostic output
+  - `results/diagnostics/monthly_htm_coverage.csv` as monthly diagnostics
+  - Legacy `results/tables/state_quarter_htm_shares.csv` generation and standalone choropleth rerun command
+- Added explicit links to source-of-truth docs for schema/provenance/script organization:
+  - `PNADC_REQUIRED_VARIABLES.md`
+  - `RESULTS_PROVENANCE.md`
+  - `scripts/README.md`
+- Added practical troubleshooting guidance for missing parquet, geospatial dependency/download issues, schema mismatch, and IRF fallback behavior.
+
+**Updated files:** `README.md`, `development_status.md`
+
 ## Latest Update — 2026-04-30
 
 ### Monthly PNADC H2M batch pipeline
