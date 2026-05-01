@@ -146,6 +146,7 @@ def test_local_projection_outputs_requested_horizons_for_both_specs(tmp_path):
     assert set(irf["shock_multiplier"]) == {-1.0, 1.0}
     assert set(irf["horizon"]) == {0, 1, 2}
     assert set(irf["term"]) == {
+        "aggregate_response_at_mean_composition",
         "mp_shock",
         "mp_shock_x_share_PH2M",
         "mp_shock_x_share_WH2M",
@@ -156,6 +157,10 @@ def test_local_projection_outputs_requested_horizons_for_both_specs(tmp_path):
     }.issubset(set(irf["term_label"]))
     base_mp = irf.loc[irf["term"].eq("mp_shock") & irf["spec"].isin(["lag1", "lag2"])]
     assert not base_mp["estimate"].isna().any()
+    aggregate = irf.loc[irf["term"].eq("aggregate_response_at_mean_composition")]
+    assert set(aggregate["term_role"]) == {"aggregate_total_irf"}
+    assert not aggregate["with_time_fe"].any()
+    assert not aggregate["estimate"].isna().any()
     assert not (
         irf["term"].isin(["share_PH2M", "share_WH2M"])
         & irf["term_role"].eq("household_share_interaction")
@@ -246,6 +251,26 @@ def test_scaled_exposure_effects_use_share_delta(tmp_path):
     assert scaled.loc[~interaction, "plot_estimate"].isna().all()
 
 
+def test_aggregate_irf_table_and_plot_are_written(tmp_path):
+    consumption_path, htm_path, shock_path = _synthetic_inputs(tmp_path, n_months=8)
+    panel, _ = lp.build_matched_panel(
+        lp.read_consumption(consumption_path),
+        lp.read_htm_shares(htm_path),
+        lp.read_shocks(shock_path),
+    )
+
+    irf, _ = lp.run_local_projections(panel, max_horizon=2)
+    aggregate = lp.aggregate_irf_table(irf)
+    path = tmp_path / "aggregate_cumulative.png"
+    lp.plot_aggregate_irf(aggregate, "cumulative", path)
+
+    assert set(aggregate["term"]) == {"aggregate_response_at_mean_composition"}
+    assert set(aggregate["response_type"]) == {"cumulative", "marginal"}
+    assert set(aggregate["spec"]) == {"lag1", "lag2"}
+    assert set(aggregate["horizon"]) == {0, 1, 2}
+    assert path.exists() and path.stat().st_size > 0
+
+
 def test_state_level_irfs_and_region_panels_are_written(tmp_path):
     consumption_path, htm_path, shock_path = _synthetic_inputs(
         tmp_path,
@@ -267,6 +292,12 @@ def test_state_level_irfs_and_region_panels_are_written(tmp_path):
     assert set(state_irf["term"]) == {"mp_shock"}
     assert set(state_irf["term_role"]) == {"descriptive_state_irf"}
     assert state_irf["household_exposure"].fillna("").eq("").all()
+    assert {"avg_share_PH2M", "avg_share_WH2M", "avg_share_Ricardian"}.issubset(
+        state_irf.columns
+    )
+    assert state_irf["avg_share_PH2M"].between(0, 1).all()
+    assert state_irf["avg_share_WH2M"].between(0, 1).all()
+    assert state_irf["avg_share_Ricardian"].between(0, 1).all()
     assert set(state_irf["shock_direction"]) == {
         "contractionary_rate_surprise",
         "expansionary_rate_surprise",
