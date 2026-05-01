@@ -9,9 +9,12 @@ Default inputs:
 Default outputs:
     results/datasets/basic_state_month_lp/state_month_lp_dataset.csv
     results/tables/basic_state_month_lp/irf.csv
+    results/tables/basic_state_month_lp/aggregate_irf.csv
     results/tables/basic_state_month_lp/state_irf.csv
     results/plots/basic_state_month_lp/cumulative_irf.png
     results/plots/basic_state_month_lp/marginal_irf.png
+    results/plots/basic_state_month_lp/aggregate_cumulative_irf.png
+    results/plots/basic_state_month_lp/aggregate_marginal_irf.png
     results/plots/basic_state_month_lp/state_regions/*.png
     results/diagnostics/basic_state_month_lp/merge_summary.csv
     results/diagnostics/basic_state_month_lp/time_fe_diagnostics.csv
@@ -43,6 +46,7 @@ RESPONSE_TYPES = ("cumulative", "marginal")
 SHOCK_VARIABLE = "mp_shock"
 SHOCK_TYPE = "Monthly monetary-policy shock from DI surprise"
 INTERACTION_TERMS = ["mp_shock_x_share_PH2M", "mp_shock_x_share_WH2M"]
+AGGREGATE_TERM = "aggregate_response_at_mean_composition"
 PREFERRED_SPECS = ["lag1_time_fe", "lag2_time_fe"]
 DEFAULT_PLOT_SHARE_DELTA = 0.10
 SHOCK_DIRECTIONS = {
@@ -155,6 +159,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--irf-out",
         default="results/tables/basic_state_month_lp/irf.csv",
+        type=Path,
+    )
+    parser.add_argument(
+        "--aggregate-irf-out",
+        default="results/tables/basic_state_month_lp/aggregate_irf.csv",
         type=Path,
     )
     parser.add_argument(
@@ -626,6 +635,19 @@ def _term_metadata(term: str, with_time_fe: bool) -> dict[str, object]:
                 "share interaction is the omitted baseline."
             ),
         }
+    if term == AGGREGATE_TERM:
+        return {
+            "term_label": "Aggregate response at mean household composition",
+            "term_role": "aggregate_total_irf",
+            "household_exposure": "sample_mean_composition",
+            "baseline_household_type": "Ricardian",
+            "term_note": (
+                "Linear combination of mp_shock plus PH2M/WH2M shock-share "
+                "interactions evaluated at the horizon-specific sample mean "
+                "lagged household shares. This aggregate level effect is not "
+                "identified in month-FE specifications."
+            ),
+        }
     return {
         "term_label": term,
         "term_role": "other",
@@ -709,6 +731,29 @@ def _identification_diagnostic(
     }
 
 
+def _linear_combo(fit, weights: dict[str, float]) -> tuple[float, float]:
+    params = fit.params
+    if any(term not in params.index for term in weights):
+        return np.nan, np.nan
+
+    estimate = float(sum(weight * params[term] for term, weight in weights.items()))
+    cov = fit.cov_params()
+    variance = 0.0
+    for left, left_weight in weights.items():
+        for right, right_weight in weights.items():
+            variance += left_weight * right_weight * float(cov.loc[left, right])
+    std_error = float(np.sqrt(max(variance, 0.0)))
+    return estimate, std_error
+
+
+def _mean_composition_weights(reg_df: pd.DataFrame) -> dict[str, float]:
+    return {
+        "mp_shock": 1.0,
+        "mp_shock_x_share_PH2M": float(reg_df["lag1_share_PH2M"].mean()),
+        "mp_shock_x_share_WH2M": float(reg_df["lag1_share_WH2M"].mean()),
+    }
+
+
 def run_local_projections(
     panel: pd.DataFrame,
     max_horizon: int,
@@ -770,6 +815,38 @@ def run_local_projections(
                                 "note": note,
                             }
                         )
+                if not with_time_fe:
+                    weights = _mean_composition_weights(reg_df)
+                    raw_estimate, std_error = _linear_combo(fit, weights)
+                    identified = not np.isnan(raw_estimate)
+                    for shock_meta in shock_metas:
+                        shock_multiplier = float(shock_meta["shock_multiplier"])
+                        estimate = raw_estimate * shock_multiplier if identified else np.nan
+                        conf_low = estimate - 1.96 * std_error if identified else np.nan
+                        conf_high = estimate + 1.96 * std_error if identified else np.nan
+                        records.append(
+                            {
+                                "response_type": response_type,
+                                **shock_meta,
+                                "spec": spec,
+                                "with_time_fe": with_time_fe,
+                                "horizon": horizon,
+                                "term": AGGREGATE_TERM,
+                                **_term_metadata(AGGREGATE_TERM, with_time_fe=with_time_fe),
+                                "estimate": estimate,
+                                "std_error": std_error if identified else np.nan,
+                                "conf_low": conf_low,
+                                "conf_high": conf_high,
+                                "n_obs": int(fit.nobs),
+                                "n_states": int(reg_df["uf_code"].nunique()),
+                                "identified": identified,
+                                "note": (
+                                    "Aggregate total IRF evaluated at sample mean "
+                                    f"lagged shares: PH2M={weights['mp_shock_x_share_PH2M']:.4f}, "
+                                    f"WH2M={weights['mp_shock_x_share_WH2M']:.4f}."
+                                ),
+                            }
+                        )
 
     irf = pd.DataFrame(records)
     expected = pd.MultiIndex.from_product(
@@ -793,6 +870,11 @@ def run_state_local_projections(
 ) -> pd.DataFrame:
     specs = _state_spec_definitions()
     shock_metas = [_shock_metadata(direction) for direction in _selected_shock_directions(shock_direction)]
+    state_share_means = (
+        panel.groupby("uf_code", sort=True)[SHARE_COLS]
+        .mean()
+        .rename(columns={col: f"avg_{col}" for col in SHARE_COLS})
+    )
     records: list[dict[str, object]] = []
     for response_type in response_types:
         if response_type not in RESPONSE_TYPES:
@@ -809,6 +891,7 @@ def run_state_local_projections(
                     std_error = float(fit.bse.get("mp_shock", np.nan))
                     state_name = str(reg_df["state_name"].iloc[0])
                     macro_region = str(reg_df["macro_region"].iloc[0])
+                    avg_shares = state_share_means.loc[int(uf_code)]
                     for shock_meta in shock_metas:
                         shock_multiplier = float(shock_meta["shock_multiplier"])
                         estimate = raw_estimate * shock_multiplier
@@ -821,6 +904,9 @@ def run_state_local_projections(
                                 "uf_code": int(uf_code),
                                 "state_name": state_name,
                                 "macro_region": macro_region,
+                                "avg_share_PH2M": float(avg_shares["avg_share_PH2M"]),
+                                "avg_share_WH2M": float(avg_shares["avg_share_WH2M"]),
+                                "avg_share_Ricardian": float(avg_shares["avg_share_Ricardian"]),
                                 "horizon": horizon,
                                 "term": "mp_shock",
                                 "term_label": "State-level shock response",
@@ -964,8 +1050,90 @@ def plot_irf(
     plt.close(fig)
 
 
+def aggregate_irf_table(irf: pd.DataFrame) -> pd.DataFrame:
+    aggregate = irf.loc[
+        irf["term"].eq(AGGREGATE_TERM) & irf["identified"]
+    ].copy()
+    if aggregate.empty:
+        raise ValueError("Aggregate IRF output is empty.")
+    return aggregate.sort_values(["response_type", "shock_direction", "spec", "horizon"])
+
+
+def plot_aggregate_irf(aggregate_irf: pd.DataFrame, response_type: str, path: Path) -> None:
+    subset = aggregate_irf.loc[
+        aggregate_irf["response_type"].eq(response_type)
+        & aggregate_irf["identified"]
+    ].copy()
+    directions = [
+        direction for direction in SHOCK_DIRECTIONS if direction in set(subset["shock_direction"])
+    ]
+    if not directions:
+        directions = sorted(subset["shock_direction"].dropna().unique())
+
+    n_cols = max(1, len(directions))
+    fig, axes = plt.subplots(
+        1,
+        n_cols,
+        figsize=(5.2 * n_cols, 3.6),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    colors = {"lag1": "#1f77b4", "lag2": "#d62728"}
+    ylabel = (
+        "Cumulative log response"
+        if response_type == "cumulative"
+        else "Marginal monthly log response"
+    )
+    if subset.empty:
+        axes[0, 0].text(0.5, 0.5, "No aggregate IRF", ha="center")
+        axes[0, 0].set_axis_off()
+    else:
+        for col_idx, direction in enumerate(directions):
+            ax = axes[0, col_idx]
+            direction_df = subset.loc[subset["shock_direction"].eq(direction)]
+            for spec in ["lag1", "lag2"]:
+                spec_df = direction_df.loc[direction_df["spec"].eq(spec)].sort_values("horizon")
+                if spec_df.empty:
+                    continue
+                x = spec_df["horizon"].to_numpy(dtype=float)
+                estimate = spec_df["estimate"].to_numpy(dtype=float)
+                low = spec_df["conf_low"].to_numpy(dtype=float)
+                high = spec_df["conf_high"].to_numpy(dtype=float)
+                ax.plot(x, estimate, label=spec, color=colors.get(spec))
+                ax.fill_between(x, low, high, color=colors.get(spec), alpha=0.15, linewidth=0)
+            ax.axhline(0, color="black", linewidth=0.8)
+            shock_label = (
+                direction_df["shock_plot_label"].dropna().iloc[0]
+                if not direction_df.empty
+                else direction
+            )
+            ax.set_title(shock_label, fontsize=10)
+            ax.set_xlabel("Horizon (months)")
+            if col_idx == 0:
+                ax.set_ylabel(ylabel)
+            ax.legend(title="Spec", fontsize=8)
+    fig.suptitle(
+        f"Aggregate State-Month {response_type.title()} LP IRF at Mean Composition",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
 def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _state_share_label(state_df: pd.DataFrame) -> str:
+    row = state_df.iloc[0]
+    return (
+        f"PH2M {100 * row['avg_share_PH2M']:.1f}%, "
+        f"WH2M {100 * row['avg_share_WH2M']:.1f}%, "
+        f"Ric {100 * row['avg_share_Ricardian']:.1f}%"
+    )
 
 
 def plot_state_region_irfs(state_irf: pd.DataFrame, state_plot_dir: Path) -> list[Path]:
@@ -986,6 +1154,11 @@ def plot_state_region_irfs(state_irf: pd.DataFrame, state_plot_dir: Path) -> lis
                     n_states = len(states)
                     n_cols = 3
                     n_rows = int(np.ceil(n_states / n_cols))
+                    ylabel = (
+                        "Cumulative log response"
+                        if response_type == "cumulative"
+                        else "Marginal monthly log response"
+                    )
                     fig, axes = plt.subplots(
                         n_rows,
                         n_cols,
@@ -1003,22 +1176,20 @@ def plot_state_region_irfs(state_irf: pd.DataFrame, state_plot_dir: Path) -> lis
                         ax.plot(x, estimate, color="#1f77b4", linewidth=1.4)
                         ax.fill_between(x, low, high, color="#1f77b4", alpha=0.14, linewidth=0)
                         ax.axhline(0, color="black", linewidth=0.7)
-                        ax.set_title(f"{state.state_name} ({state.uf_code})", fontsize=9)
+                        ax.set_title(
+                            f"{state.state_name} ({state.uf_code})\n{_state_share_label(state_df)}",
+                            fontsize=8.5,
+                        )
+                        ax.set_xlabel("Horizon (months)", fontsize=8)
+                        ax.set_ylabel(ylabel, fontsize=8)
                         ax.tick_params(labelsize=8)
                     for ax in axes_arr[n_states:]:
                         ax.set_visible(False)
-                    ylabel = (
-                        "Cumulative log response"
-                        if response_type == "cumulative"
-                        else "Marginal monthly log response"
-                    )
                     fig.suptitle(
                         f"{region}: descriptive state-level {response_type} IRFs to "
                         f"{region_df['shock_plot_label'].iloc[0]} ({spec})",
                         fontsize=13,
                     )
-                    fig.supxlabel("Horizon (months)", fontsize=10)
-                    fig.supylabel(ylabel, fontsize=10)
                     fig.tight_layout(rect=[0, 0, 1, 0.95])
                     path = (
                         state_plot_dir
@@ -1038,6 +1209,7 @@ def write_outputs(
     summary: pd.DataFrame,
     dataset_out: Path,
     irf_out: Path,
+    aggregate_irf_out: Path,
     state_irf_out: Path,
     plot_dir: Path,
     state_plot_dir: Path,
@@ -1045,16 +1217,35 @@ def write_outputs(
     time_fe_diagnostics_out: Path,
     plot_share_delta: float = DEFAULT_PLOT_SHARE_DELTA,
 ) -> list[Path]:
-    for path in [dataset_out, irf_out, state_irf_out, summary_out, time_fe_diagnostics_out]:
+    for path in [
+        dataset_out,
+        irf_out,
+        aggregate_irf_out,
+        state_irf_out,
+        summary_out,
+        time_fe_diagnostics_out,
+    ]:
         path.parent.mkdir(parents=True, exist_ok=True)
     irf = add_scaled_exposure_effects(irf, share_delta=plot_share_delta)
+    aggregate_irf = aggregate_irf_table(irf)
     panel.to_csv(dataset_out, index=False)
     irf.to_csv(irf_out, index=False)
+    aggregate_irf.to_csv(aggregate_irf_out, index=False)
     state_irf.to_csv(state_irf_out, index=False)
     summary.to_csv(summary_out, index=False)
     time_fe_diagnostics.to_csv(time_fe_diagnostics_out, index=False)
     plot_irf(irf, "cumulative", plot_dir / "cumulative_irf.png", share_delta=plot_share_delta)
     plot_irf(irf, "marginal", plot_dir / "marginal_irf.png", share_delta=plot_share_delta)
+    plot_aggregate_irf(
+        aggregate_irf,
+        "cumulative",
+        plot_dir / "aggregate_cumulative_irf.png",
+    )
+    plot_aggregate_irf(
+        aggregate_irf,
+        "marginal",
+        plot_dir / "aggregate_marginal_irf.png",
+    )
     return plot_state_region_irfs(state_irf, state_plot_dir)
 
 
@@ -1084,6 +1275,7 @@ def main() -> None:
         summary,
         args.dataset_out,
         args.irf_out,
+        args.aggregate_irf_out,
         args.state_irf_out,
         args.plot_dir,
         args.state_plot_dir,
@@ -1099,6 +1291,7 @@ def main() -> None:
     )
     print(f"Wrote dataset: {args.dataset_out}")
     print(f"Wrote IRF table: {args.irf_out}")
+    print(f"Wrote aggregate IRF table: {args.aggregate_irf_out}")
     print(f"Wrote state IRF table: {args.state_irf_out}")
     print(f"Wrote plots: {args.plot_dir}")
     print(f"Wrote {len(state_plot_paths)} state-region panel plots: {args.state_plot_dir}")
