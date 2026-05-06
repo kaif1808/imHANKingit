@@ -4,6 +4,7 @@ Build a matched state-month panel and run basic fixed-effect local projections.
 Default inputs:
     Data/state_data/monthly_state_consumption.csv
     results/tables/state_month_htm_shares.parquet
+    results/tables/state_month_labour_market.parquet
     results/diagnostics/shock_transformation_log.csv
 
 Default outputs:
@@ -41,6 +42,14 @@ import statsmodels.formula.api as smf
 
 DATE_COLUMN_RE = re.compile(r"^\d{4}\.(0[1-9]|1[0-2])$")
 SHARE_COLS = ["share_PH2M", "share_WH2M", "share_Ricardian"]
+LABOUR_COLS = [
+    "unemployment_rate",
+    "labour_force_participation_rate",
+    "formal_share",
+    "informal_share",
+    "conta_propria_share",
+    "population",
+]
 MATCH_REQUIRED_COLS = ["consumption_index", "mp_shock", *SHARE_COLS]
 RESPONSE_TYPES = ("cumulative", "marginal")
 SHOCK_VARIABLE = "mp_shock"
@@ -126,6 +135,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
     )
     parser.add_argument(
+        "--labour-market",
+        default="results/tables/state_month_labour_market.parquet",
+        type=Path,
+    )
+    parser.add_argument(
         "--shock-log",
         default="results/diagnostics/shock_transformation_log.csv",
         type=Path,
@@ -197,7 +211,15 @@ def parse_args() -> argparse.Namespace:
 def _date_range_label(df: pd.DataFrame) -> tuple[str | None, str | None]:
     if df.empty:
         return None, None
-    dates = pd.to_datetime(df["date"])
+    # Prefer an existing date column; otherwise build from year/month if available.
+    if "date" in df.columns:
+        dates = pd.to_datetime(df["date"])
+    elif {"year", "month"}.issubset(df.columns):
+        dates = pd.to_datetime(
+            {"year": df["year"].astype(int), "month": df["month"].astype(int), "day": 1}
+        )
+    else:
+        return None, None
     return dates.min().strftime("%Y-%m"), dates.max().strftime("%Y-%m")
 
 
@@ -267,6 +289,42 @@ def read_htm_shares(path: Path) -> pd.DataFrame:
     return htm.sort_values(["uf_code", "year", "month"])
 
 
+def read_labour_market(path: Path) -> pd.DataFrame:
+    labour = pd.read_parquet(path)
+    required = ["uf_code", "year", "month", *LABOUR_COLS]
+    missing = [col for col in required if col not in labour.columns]
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {missing}")
+
+    labour = labour[required].copy()
+    # Convert numeric columns safely (keep NA where present)
+    labour["uf_code"] = pd.to_numeric(labour["uf_code"], errors="coerce")
+    labour["year"] = pd.to_numeric(labour["year"], errors="coerce")
+    labour["month"] = pd.to_numeric(labour["month"], errors="coerce")
+    for col in LABOUR_COLS:
+        labour[col] = pd.to_numeric(labour[col], errors="coerce")
+
+    # Build a proper date column safely even when year/month contain NA
+    def _make_date(row):
+        y = row["year"]
+        m = row["month"]
+        if pd.isna(y) or pd.isna(m):
+            return pd.NaT
+        try:
+            return pd.Timestamp(int(y), int(m), 1)
+        except Exception:
+            return pd.NaT
+
+    labour["date"] = labour.apply(_make_date, axis=1)
+
+    # Use pandas nullable integer dtype for keys
+    labour["uf_code"] = labour["uf_code"].astype("Int64")
+    labour["year"] = labour["year"].astype("Int64")
+    labour["month"] = labour["month"].astype("Int64")
+
+    return labour.sort_values(["uf_code", "year", "month"])
+
+
 def read_shocks(path: Path) -> pd.DataFrame:
     shocks = pd.read_csv(path)
     required = ["year", "month", "mp_shock_monthly"]
@@ -307,11 +365,13 @@ def _summary_row(
 def build_matched_panel(
     consumption: pd.DataFrame,
     htm: pd.DataFrame,
+    labour: pd.DataFrame,
     shocks: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     summary_rows = [
         _summary_row("consumption_long", consumption),
         _summary_row("htm_shares", htm),
+        _summary_row("labour_market", labour),
         _summary_row("shocks", shocks),
     ]
 
@@ -321,12 +381,18 @@ def build_matched_panel(
         how="inner",
         validate="one_to_one",
     )
+    consumption_htm = consumption_htm.merge(
+        labour[["uf_code", "year", "month", *LABOUR_COLS]],
+        on=["uf_code", "year", "month"],
+        how="left",
+        validate="one_to_one",
+    )
     summary_rows.append(
         _summary_row(
-            "consumption_htm_inner",
+            "consumption_htm_labour_left",
             consumption_htm,
             dropped_from_previous=len(consumption) - len(consumption_htm),
-            note="Inner join on uf_code, year, month.",
+            note="Inner join HtM shares, then left join labour-market metrics on uf_code, year, month.",
         )
     )
 
@@ -1253,8 +1319,16 @@ def main() -> None:
     args = parse_args()
     consumption = read_consumption(args.consumption_csv)
     htm = read_htm_shares(args.htm_shares)
+    labour = read_labour_market(args.labour_market)
     shocks = read_shocks(args.shock_log)
-    panel, summary = build_matched_panel(consumption, htm, shocks)
+    # Ensure panel has a date column (fallback from year/month when missing)
+    panel, summary = build_matched_panel(consumption, htm, labour, shocks)
+
+    if "date" not in panel.columns:
+        panel["date"] = pd.to_datetime(
+            {"year": panel["year"].astype(int), "month": panel["month"].astype(int), "day": 1}
+        )
+
     validate_panel(panel, max_horizon=args.max_horizon)
     irf, time_fe_diagnostics = run_local_projections(
         panel,
