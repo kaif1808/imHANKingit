@@ -79,3 +79,4 @@ pnadc_matched_with_periods.parquet
 .claude/
 .posit/
 .pytest_cache/
+data_wishlist
