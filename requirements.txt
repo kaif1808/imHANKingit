@@ -11,3 +11,4 @@ geopandas>=0.14
 beautifulsoup4>=4.12
 statspai>=0.1
 pyfixest>=0.25
+sequence-jacobian>=1.0.0

@@ -1,0 +1,23 @@
+{
+  "input_checks": {
+    "pnadc_exists": true,
+    "pof_dir_exists": true,
+    "pmc_csv_exists": true,
+    "selic_csv_exists": true,
+    "ipca_xlsx_exists": true
+  },
+  "outputs": {
+    "pmc_rows": 5832,
+    "selic_rows": 132,
+    "ipca_rows": 183,
+    "scr_rows": 648,
+    "panel_rows": 5832,
+    "panel_uf_count": 27,
+    "panel_date_min": "2007-01",
+    "panel_date_max": "2025-12",
+    "scr_downloaded_years": [
+      2022,
+      2023
+    ]
+  }
+}
