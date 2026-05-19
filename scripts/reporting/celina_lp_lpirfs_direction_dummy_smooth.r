@@ -6,16 +6,17 @@ suppressPackageStartupMessages({
 })
 
 set.seed(42)
-cat("\n=== LPIRFS INCOME HETEROGENEITY (directional dummies, TWFE only) ===\n\n")
+cat("\n=== LPIRFS CONSUMPTION HETEROGENEITY (directional dummies, smooth logistic TWFE) ===\n\n")
 
 MAX_HORIZON <- 48
 LP_HOR <- MAX_HORIZON + 1
 CI_LEVEL <- 90
 CI_MULT <- qnorm(1 - (1 - CI_LEVEL / 100) / 2)
 SE_METHOD <- "driscoll_kraay"
+GAMMA <- 10
 
-OUT_TBL <- "results/tables/lp_income"
-OUT_PLT <- "results/plots/lp_income"
+OUT_TBL <- "results/tables/lp_controls"
+OUT_PLT <- "results/plots/lp_controls"
 dir.create(OUT_TBL, recursive = TRUE, showWarnings = FALSE)
 dir.create(OUT_PLT, recursive = TRUE, showWarnings = FALSE)
 
@@ -44,17 +45,16 @@ panel <- d_raw |>
   arrange(uf_code, year, month_num) |>
   group_by(uf_code) |>
   mutate(
-    log_income_sa = log(mean_income_sa),
+    log_consumption = log(consumption_index),
     log_imports = log(coalesce(vl_imports, 0) + 1),
     log_exports = log(coalesce(vl_exports, 0) + 1),
     log_bf = log(coalesce(total_value_BF_old, 0) + 1),
     infl_mom = log(ipca_index) - log(lag(ipca_index, 1)),
     infl_yoy_raw = log(ipca_index) - log(lag(ipca_index, 12)),
     infl_yoy = coalesce(infl_yoy_raw, infl_mom * 12),
-    lag1_li = lag(log_income_sa),
+    lag1_lc = lag(log_consumption),
     mp_shock_pos = pmax(mp_shock, 0),
     mp_shock_neg_abs = abs(pmin(mp_shock, 0)),
-    # Directional interaction shocks.
     mp_pos_x_ph2m = mp_shock_pos * lag1_share_ph2m,
     mp_neg_x_ph2m = mp_shock_neg_abs * lag1_share_ph2m,
     mp_pos_x_wh2m = mp_shock_pos * lag1_share_wh2m,
@@ -69,11 +69,11 @@ if (!"log_credit_pf" %in% names(panel)) {
 
 CTRL_BASE <- c(
   "lag1_share_ph2m", "lag1_share_wh2m", "log_imports", "log_exports",
-  "infl_yoy", "log_bf", "log_credit_pf", "lag1_li"
+  "infl_yoy", "log_bf", "log_credit_pf", "lag1_lc"
 )
 
 shock_terms <- c("mp_pos_x_ph2m", "mp_neg_x_ph2m", "mp_pos_x_wh2m", "mp_neg_x_wh2m")
-required_cols <- c("uf_code", "ym_id", "log_income_sa", shock_terms, CTRL_BASE)
+required_cols <- c("uf_code", "ym_id", "log_consumption", shock_terms, CTRL_BASE)
 missing_cols <- setdiff(required_cols, names(panel))
 if (length(missing_cols) > 0) {
   stop(sprintf("Missing required columns: %s", paste(missing_cols, collapse = ", ")))
@@ -82,21 +82,25 @@ if (length(missing_cols) > 0) {
 base_panel <- panel |>
   filter(!if_any(all_of(required_cols), is.na))
 
+if (all(is.na(base_panel$infl_yoy))) {
+  stop("switching variable infl_yoy is entirely missing after prefiltering")
+}
+
 bench_input <- base_panel |>
   select(
     uf_code,
     ym_id,
-    log_income_sa,
+    log_consumption,
     all_of(shock_terms),
     all_of(CTRL_BASE)
   )
 
 cat(sprintf("✓ Prefiltered sample: %d rows\n", nrow(base_panel)))
 
-run_lpirfs <- function(data_set, shock_var, contemp_others) {
-  lpirfs::lp_lin_panel(
+run_lpirfs_smooth <- function(data_set, shock_var, contemp_others) {
+  lpirfs::lp_nl_panel(
     data_set = data_set,
-    endog_data = "log_income_sa",
+    endog_data = "log_consumption",
     cumul_mult = TRUE,
     shock = shock_var,
     diff_shock = FALSE,
@@ -108,19 +112,25 @@ run_lpirfs <- function(data_set, shock_var, contemp_others) {
     c_exog_data = contemp_others,
     l_exog_data = CTRL_BASE,
     lags_exog_data = 1,
+    switching = "infl_yoy",
+    use_logistic = TRUE,
+    lag_switching = TRUE,
+    use_hp = FALSE,
+    gamma = GAMMA,
     confint = CI_MULT,
     hor = LP_HOR
   )
 }
 
 extract_series <- function(res_obj, term, shock_sd) {
-  irf_mean <- as.numeric(res_obj$irf_panel_mean[1, ])
-  irf_low <- as.numeric(res_obj$irf_panel_low[1, ])
-  irf_up <- as.numeric(res_obj$irf_panel_up[1, ])
-  nobs_h <- map_dbl(res_obj$reg_outputs, ~ as.numeric(tryCatch(stats::nobs(.x), error = function(e) NA_real_)))
+  # lp_nl_panel returns two state-specific IRFs; keep the high-inflation regime path (state 2).
+  irf_mean <- as.numeric(res_obj$irf_s2_mean[1, ])
+  irf_low <- as.numeric(res_obj$irf_s2_low[1, ])
+  irf_up <- as.numeric(res_obj$irf_s2_up[1, ])
+  nobs_h <- map_dbl(res_obj$xy_data_sets, ~ as.numeric(nrow(.x)))
 
   if (!(length(irf_mean) == LP_HOR && length(nobs_h) == LP_HOR)) {
-    stop(sprintf("Unexpected horizon length from lp_lin_panel for %s", term))
+    stop(sprintf("Unexpected horizon length from lp_nl_panel for %s", term))
   }
 
   tibble(
@@ -137,7 +147,10 @@ extract_series <- function(res_obj, term, shock_sd) {
     nobs = nobs_h,
     se_method = SE_METHOD,
     response_type = "cumulative",
-    spec = "twfe_directional_dummies"
+    state_regime = "high_inflation_s2",
+    switching_var = "infl_yoy",
+    logistic_gamma = GAMMA,
+    spec = "twfe_directional_dummies_smooth_logistic"
   )
 }
 
@@ -145,16 +158,16 @@ shock_sd <- sapply(shock_terms, function(v) stats::sd(bench_input[[v]], na.rm = 
 rows <- list()
 
 for (term in shock_terms) {
-  cat(sprintf("→ Running TWFE LP for %s ...\n", term))
+  cat(sprintf("→ Running smooth TWFE LP for %s ...\n", term))
   others <- setdiff(shock_terms, term)
-  res <- run_lpirfs(bench_input, term, others)
+  res <- run_lpirfs_smooth(bench_input, term, others)
   rows[[length(rows) + 1]] <- extract_series(res, term, shock_sd[[term]])
 }
 
 out_df <- bind_rows(rows)
-out_csv <- file.path(OUT_TBL, "irf_income_directional_dummies_twfe_dk.csv")
+out_csv <- file.path(OUT_TBL, "irf_consumption_directional_dummies_twfe_dk_smooth.csv")
 write_csv(out_df, out_csv)
-cat(sprintf("✓ Saved benchmark table: %s\n", out_csv))
+cat(sprintf("✓ Saved smooth benchmark table: %s\n", out_csv))
 
 plot_df <- out_df |>
   mutate(
@@ -174,10 +187,10 @@ p <- ggplot(plot_df, aes(x = horizon, y = estimate_1sd)) +
   facet_wrap(~panel_label, nrow = 2, ncol = 2, scales = "free_y") +
   scale_x_continuous(breaks = seq(0, MAX_HORIZON, by = 6), limits = c(0, MAX_HORIZON)) +
   labs(
-    title = "Income LP IRFs with Directional Dummies (TWFE)",
-    subtitle = "Outcome: log(mean_income_sa); one LP per directional interaction shock; Driscoll-Kraay 90% CI; responses scaled to 1-SD of each shock",
+    title = "Consumption LP IRFs with Directional Dummies (Smooth Logistic TWFE)",
+    subtitle = "Smooth logistic state transition on lagged infl_yoy; cumulative responses; Driscoll-Kraay 90% CI; responses scaled to 1-SD of each shock",
     x = "Horizon (months)",
-    y = "Cumulative log income response (for 1-SD directional interaction shock)"
+    y = "Cumulative log consumption response (for 1-SD directional interaction shock)"
   ) +
   theme_bw(base_size = 11) +
   theme(
@@ -186,9 +199,9 @@ p <- ggplot(plot_df, aes(x = horizon, y = estimate_1sd)) +
     legend.position = "none"
   )
 
-out_png <- file.path(OUT_PLT, "irf_income_directional_dummies_twfe_dk_4panel.png")
+out_png <- file.path(OUT_PLT, "irf_consumption_directional_dummies_twfe_dk_smooth_4panel.png")
 ggsave(out_png, p, width = 11, height = 8.5, dpi = 300)
-cat(sprintf("✓ Saved benchmark plot: %s\n", out_png))
+cat(sprintf("✓ Saved smooth benchmark plot: %s\n", out_png))
 
 check_h <- identical(sort(unique(out_df$horizon)), 0:MAX_HORIZON)
 term_counts <- out_df |> count(term) |> pull(n)
@@ -197,15 +210,23 @@ check_nobs <- out_df |>
   group_by(term) |>
   summarise(non_increasing = all(diff(nobs) <= 0, na.rm = TRUE), .groups = "drop")
 
+required_out_cols <- c(
+  "horizon", "term", "estimate", "se", "ci_low", "ci_high",
+  "shock_sd", "estimate_1sd", "ci_low_1sd", "ci_high_1sd",
+  "nobs", "se_method", "spec"
+)
+check_cols <- all(required_out_cols %in% names(out_df))
+
 cat("\nVerification:\n")
 cat(sprintf("  - horizons exactly 0:%d: %s\n", MAX_HORIZON, ifelse(check_h, "OK", "FAIL")))
 cat(sprintf("  - full coefficient paths present (4 directional terms): %s\n", ifelse(check_terms, "OK", "FAIL")))
+cat(sprintf("  - required output columns present: %s\n", ifelse(check_cols, "OK", "FAIL")))
 cat("  - nobs weakly non-increasing by series:\n")
 print(check_nobs)
 
 cat("\nNotes:\n")
 cat("  - TWFE only (panel_effect='twoways').\n")
-cat("  - Implemented directional heterogeneity via separate directional shock interactions, not lp_nl_panel.\n")
-cat("  - Each LP includes the other three directional shocks as contemporaneous controls.\n")
+cat("  - Smooth nonlinear LP via lp_nl_panel with logistic switching on lagged infl_yoy.\n")
+cat("  - Reported IRF path is state 2 (high-inflation regime) and each LP controls for the other three directional shocks contemporaneously.\n")
 
-cat("\n=== LPIRFS INCOME HETEROGENEITY COMPLETE ===\n")
+cat("\n=== LPIRFS CONSUMPTION HETEROGENEITY (SMOOTH) COMPLETE ===\n")

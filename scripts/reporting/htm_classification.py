@@ -34,15 +34,16 @@ warnings.filterwarnings("ignore")
 # Configuration
 # ============================================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "Data" / "Dados_20230713"
-DICT_FILE = BASE_DIR / "Data" / "Documentacao_20230713" / "Dicionarios de variaveis.xls"
-RESULTS_DIR = BASE_DIR / "results"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parents[1]
+DATA_DIR = PROJECT_ROOT / "Data" / "Dados_20230713"
+DICT_FILE = PROJECT_ROOT / "Data" / "Documentacao_20230713" / "Dicionarios de variaveis.xls"
+RESULTS_DIR = PROJECT_ROOT / "results"
 TABLES_DIR = RESULTS_DIR / "tables"
 PLOTS_DIR = RESULTS_DIR / "plots"
 DIAGNOSTICS_DIR = RESULTS_DIR / "diagnostics"
 
-PNAD_MATCHED_DEFAULT = BASE_DIR / "pnadc_matched_with_periods.parquet"
+PNAD_MATCHED_DEFAULT = PROJECT_ROOT / "pnadc_matched_with_periods.parquet"
 
 SELIC_RATE = 0.09
 LIQUID_THRESH = 0.50
@@ -197,6 +198,160 @@ def classify_agent(row: pd.Series) -> str:
     return "PH2M"
 
 
+def classify_agent_poverty_split(row: pd.Series) -> str:
+    """
+    Parallel classification:
+    - Ricardian if liquid ratio above threshold
+    - Otherwise H2M split by poverty status
+    """
+    if row["liquid_ratio"] > LIQUID_THRESH:
+        return "Ricardian"
+    return "PH2M" if bool(row["is_poor"]) else "WH2M"
+
+
+def classify_agent_classical(row: pd.Series, net_worth_cutoff: float) -> str:
+    """
+    Classical H2M-style parallel classification:
+    - Ricardian: liquid ratio above threshold
+    - H2M: liquid ratio below/equal threshold, split by net-worth cutoff
+      into poor (below cutoff) and wealthy (above/equal cutoff).
+    """
+    if row["liquid_ratio"] > LIQUID_THRESH:
+        return "Ricardian"
+    return "WH2M" if row["net_worth"] >= net_worth_cutoff else "PH2M"
+
+
+def _component_metrics() -> list[str]:
+    return [
+        "monthly_income",
+        "pc_income",
+        "total_labor_income",
+        "total_transfers",
+        "pension_income",
+        "govt_transfers",
+        "financial_income",
+        "other_labor_inc",
+        "liquid_assets",
+        "illiquid_assets",
+        "liquid_ratio",
+        "illiquid_ratio",
+    ]
+
+
+def _weighted_group_component_summary(
+    pof: pd.DataFrame,
+    *,
+    agent_col: str = "agent_type",
+) -> pd.DataFrame:
+    """Weighted means of income/wealth components by group label in agent_col."""
+    metrics = [
+        *_component_metrics(),
+    ]
+
+    def _summarize(group: pd.DataFrame) -> pd.Series:
+        w = pd.to_numeric(group["PESO_FINAL"], errors="coerce").fillna(0.0)
+        out: dict[str, float] = {
+            "weighted_n": float(w.sum()),
+            "n_obs": int(len(group)),
+        }
+        for metric in metrics:
+            vals = pd.to_numeric(group[metric], errors="coerce")
+            valid = vals.notna() & w.gt(0)
+            out[f"mean_{metric}"] = (
+                float(np.average(vals.loc[valid], weights=w.loc[valid])) if valid.any() else np.nan
+            )
+        return pd.Series(out)
+
+    return (
+        pof.groupby(agent_col, as_index=False)
+        .apply(_summarize)
+        .reset_index(drop=True)
+        .rename(columns={agent_col: "agent_type"})
+        .sort_values("agent_type")
+        .reset_index(drop=True)
+    )
+
+
+def _bin_unit_expected_summary(
+    pof: pd.DataFrame,
+    *,
+    agent_col: str,
+    bin_col: str = "bin_key",
+) -> pd.DataFrame:
+    """
+    Final-bin comparison: each bin is a unit, aggregated via expected group mass.
+    Weight for group g in bin b = bin_weight_b * prob(g|b).
+    """
+    metrics = _component_metrics()
+
+    def _bin_wavg(group: pd.DataFrame, metric: str) -> float:
+        vals = pd.to_numeric(group[metric], errors="coerce")
+        w = pd.to_numeric(group["PESO_FINAL"], errors="coerce").fillna(0.0)
+        valid = vals.notna() & w.gt(0)
+        if not valid.any():
+            return np.nan
+        return float(np.average(vals.loc[valid], weights=w.loc[valid]))
+
+    rows: list[dict[str, float | str]] = []
+    for bk, g in pof.groupby(bin_col):
+        bin_w = pd.to_numeric(g["PESO_FINAL"], errors="coerce").fillna(0.0)
+        row: dict[str, float | str] = {"bin_key": bk, "bin_weight": float(bin_w.sum())}
+        for metric in metrics:
+            row[f"bin_mean_{metric}"] = _bin_wavg(g, metric)
+        rows.append(row)
+    bin_means = pd.DataFrame(rows)
+
+    weighted = (
+        pof.pivot_table(index=bin_col, columns=agent_col, values="PESO_FINAL", aggfunc="sum", fill_value=0)
+        .reset_index()
+    )
+    for agent in AGENT_TYPES:
+        if agent not in weighted.columns:
+            weighted[agent] = 0.0
+    weighted["bin_weight"] = weighted[AGENT_TYPES].sum(axis=1)
+    denom = weighted["bin_weight"].replace(0, np.nan)
+    weighted["p_ph2m"] = (weighted["PH2M"] / denom).fillna(0.0)
+    weighted["p_wh2m"] = (weighted["WH2M"] / denom).fillna(0.0)
+    weighted["p_ric"] = (weighted["Ricardian"] / denom).fillna(0.0)
+
+    bin_level = bin_means.merge(weighted[[bin_col, "p_ph2m", "p_wh2m", "p_ric"]], on=bin_col, how="left")
+    prob_map = {"PH2M": "p_ph2m", "WH2M": "p_wh2m", "Ricardian": "p_ric"}
+
+    out_rows: list[dict[str, float | str | int]] = []
+    for agent_type, prob_col in prob_map.items():
+        w = (bin_level["bin_weight"] * bin_level[prob_col]).fillna(0.0)
+        rec: dict[str, float | str | int] = {
+            "agent_type": agent_type,
+            "effective_bin_weight": float(w.sum()),
+            "n_bins": int((w > 0).sum()),
+        }
+        for metric in metrics:
+            x = pd.to_numeric(bin_level[f"bin_mean_{metric}"], errors="coerce")
+            valid = x.notna() & w.gt(0)
+            rec[f"mean_{metric}"] = float(np.average(x.loc[valid], weights=w.loc[valid])) if valid.any() else np.nan
+        out_rows.append(rec)
+
+    return pd.DataFrame(out_rows).sort_values("agent_type").reset_index(drop=True)
+
+
+def _weighted_quantile(values: pd.Series, weights: pd.Series, q: float) -> float:
+    """Weighted quantile for q in [0, 1]."""
+    v = pd.to_numeric(values, errors="coerce")
+    w = pd.to_numeric(weights, errors="coerce")
+    mask = v.notna() & w.notna() & (w > 0)
+    if not mask.any():
+        return np.nan
+    x = v.loc[mask].to_numpy()
+    wt = w.loc[mask].to_numpy()
+    order = np.argsort(x)
+    x = x[order]
+    wt = wt[order]
+    cum = np.cumsum(wt) / wt.sum()
+    idx = np.searchsorted(cum, q, side="left")
+    idx = min(idx, len(x) - 1)
+    return float(x[idx])
+
+
 def build_pof_bin_shares(
     tables_dir: Path = TABLES_DIR,
 ) -> tuple[pd.DataFrame, np.ndarray, dict[str, float]]:
@@ -336,8 +491,20 @@ def build_pof_bin_shares(
     pof["pc_income"] = pof["monthly_income"] / hh_size
     pof["liquid_ratio"] = pof["liquid_assets"] / pof["monthly_income"]
     pof["illiquid_ratio"] = pof["illiquid_assets"] / pof["monthly_income"]
+    pof["net_worth"] = pof["liquid_assets"] + pof["illiquid_assets"]
     pof["is_poor"] = pof["pc_income"] <= POVERTY_LINE
     pof["agent_type"] = pof.apply(classify_agent, axis=1)
+    pof["agent_type_poverty_split"] = pof.apply(classify_agent_poverty_split, axis=1)
+    h2m_mask = pof["liquid_ratio"] <= LIQUID_THRESH
+    classical_cutoff = _weighted_quantile(
+        pof.loc[h2m_mask, "net_worth"],
+        pof.loc[h2m_mask, "PESO_FINAL"],
+        q=0.5,
+    )
+    pof["agent_type_classical"] = pof.apply(
+        lambda r: classify_agent_classical(r, classical_cutoff),
+        axis=1,
+    )
 
     weights = pof["PESO_FINAL"]
     total_w = weights.sum()
@@ -357,6 +524,38 @@ def build_pof_bin_shares(
         f"WH2M={pof_national_agent['WH2M']:.4f}  "
         f"Ricardian={pof_national_agent['Ricardian']:.4f}  "
         f"N={len(pof):,}"
+    )
+    validity = {
+        "negative_monthly_income_rows": int((pof["monthly_income"] < 0).sum()),
+        "negative_liquid_assets_rows": int((pof["liquid_assets"] < 0).sum()),
+        "negative_illiquid_assets_rows": int((pof["illiquid_assets"] < 0).sum()),
+    }
+    print(
+        "  Internal validity checks:"
+        f" neg_monthly_income={validity['negative_monthly_income_rows']},"
+        f" neg_liquid_assets={validity['negative_liquid_assets_rows']},"
+        f" neg_illiquid_assets={validity['negative_illiquid_assets_rows']}"
+    )
+
+    component_summary = _weighted_group_component_summary(pof, agent_col="agent_type")
+    component_summary_poverty_split = _weighted_group_component_summary(
+        pof, agent_col="agent_type_poverty_split"
+    )
+    component_summary_classical = _weighted_group_component_summary(
+        pof, agent_col="agent_type_classical"
+    )
+    summary_path = tables_dir / "pof_group_wealth_income_summary.csv"
+    summary_path_parallel = tables_dir / "pof_group_wealth_income_summary_poverty_split.csv"
+    summary_path_classical = tables_dir / "pof_group_wealth_income_summary_classical.csv"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    component_summary.to_csv(summary_path, index=False)
+    component_summary_poverty_split.to_csv(summary_path_parallel, index=False)
+    component_summary_classical.to_csv(summary_path_classical, index=False)
+    print(f"  Saved weighted wealth/income component summary -> {summary_path}")
+    print(f"  Saved weighted wealth/income component summary (poverty split) -> {summary_path_parallel}")
+    print(
+        f"  Saved weighted wealth/income component summary (classical H2M, "
+        f"median H2M net worth cutoff={classical_cutoff:.2f}) -> {summary_path_classical}"
     )
 
     print("\n" + "=" * 72)
@@ -384,6 +583,25 @@ def build_pof_bin_shares(
         + pof["pc_income_quintile"]
         + "|"
         + pof["labor_status"]
+    )
+
+    bin_unit_baseline = _bin_unit_expected_summary(pof, agent_col="agent_type", bin_col="bin_key")
+    bin_unit_parallel = _bin_unit_expected_summary(
+        pof, agent_col="agent_type_poverty_split", bin_col="bin_key"
+    )
+    bin_unit_classical = _bin_unit_expected_summary(
+        pof, agent_col="agent_type_classical", bin_col="bin_key"
+    )
+    bin_unit_baseline["classification"] = "baseline"
+    bin_unit_parallel["classification"] = "poverty_split"
+    bin_unit_classical["classification"] = "classical_h2m"
+    bin_compare = pd.concat([bin_unit_baseline, bin_unit_parallel, bin_unit_classical], ignore_index=True)
+    bin_compare_path = tables_dir / "pof_group_wealth_income_summary_bin_units_compare.csv"
+    bin_compare.to_csv(bin_compare_path, index=False)
+    print(
+        "  Saved bin-unit comparison summary "
+        "(baseline vs poverty split vs classical_h2m) -> "
+        f"{bin_compare_path}"
     )
 
     grouped = pof.groupby("bin_key")
