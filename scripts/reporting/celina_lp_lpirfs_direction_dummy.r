@@ -6,7 +6,7 @@ suppressPackageStartupMessages({
 })
 
 set.seed(42)
-cat("\n=== LPIRFS INCOME HETEROGENEITY (directional dummies, TWFE only) ===\n\n")
+cat("\n=== LPIRFS CONSUMPTION HETEROGENEITY (directional dummies, TWFE only) ===\n\n")
 
 MAX_HORIZON <- 48
 LP_HOR <- MAX_HORIZON + 1
@@ -14,8 +14,8 @@ CI_LEVEL <- 90
 CI_MULT <- qnorm(1 - (1 - CI_LEVEL / 100) / 2)
 SE_METHOD <- "driscoll_kraay"
 
-OUT_TBL <- "results/tables/lp_income"
-OUT_PLT <- "results/plots/lp_income"
+OUT_TBL <- "results/tables/lp_controls"
+OUT_PLT <- "results/plots/lp_controls"
 dir.create(OUT_TBL, recursive = TRUE, showWarnings = FALSE)
 dir.create(OUT_PLT, recursive = TRUE, showWarnings = FALSE)
 
@@ -44,17 +44,16 @@ panel <- d_raw |>
   arrange(uf_code, year, month_num) |>
   group_by(uf_code) |>
   mutate(
-    log_income_sa = log(mean_income_sa),
+    log_consumption = log(consumption_index),
     log_imports = log(coalesce(vl_imports, 0) + 1),
     log_exports = log(coalesce(vl_exports, 0) + 1),
     log_bf = log(coalesce(total_value_BF_old, 0) + 1),
     infl_mom = log(ipca_index) - log(lag(ipca_index, 1)),
     infl_yoy_raw = log(ipca_index) - log(lag(ipca_index, 12)),
     infl_yoy = coalesce(infl_yoy_raw, infl_mom * 12),
-    lag1_li = lag(log_income_sa),
+    lag1_lc = lag(log_consumption),
     mp_shock_pos = pmax(mp_shock, 0),
     mp_shock_neg_abs = abs(pmin(mp_shock, 0)),
-    # Directional interaction shocks.
     mp_pos_x_ph2m = mp_shock_pos * lag1_share_ph2m,
     mp_neg_x_ph2m = mp_shock_neg_abs * lag1_share_ph2m,
     mp_pos_x_wh2m = mp_shock_pos * lag1_share_wh2m,
@@ -69,11 +68,11 @@ if (!"log_credit_pf" %in% names(panel)) {
 
 CTRL_BASE <- c(
   "lag1_share_ph2m", "lag1_share_wh2m", "log_imports", "log_exports",
-  "infl_yoy", "log_bf", "log_credit_pf", "lag1_li"
+  "infl_yoy", "log_bf", "log_credit_pf", "lag1_lc"
 )
 
 shock_terms <- c("mp_pos_x_ph2m", "mp_neg_x_ph2m", "mp_pos_x_wh2m", "mp_neg_x_wh2m")
-required_cols <- c("uf_code", "ym_id", "log_income_sa", shock_terms, CTRL_BASE)
+required_cols <- c("uf_code", "ym_id", "log_consumption", shock_terms, CTRL_BASE)
 missing_cols <- setdiff(required_cols, names(panel))
 if (length(missing_cols) > 0) {
   stop(sprintf("Missing required columns: %s", paste(missing_cols, collapse = ", ")))
@@ -86,7 +85,7 @@ bench_input <- base_panel |>
   select(
     uf_code,
     ym_id,
-    log_income_sa,
+    log_consumption,
     all_of(shock_terms),
     all_of(CTRL_BASE)
   )
@@ -96,7 +95,7 @@ cat(sprintf("✓ Prefiltered sample: %d rows\n", nrow(base_panel)))
 run_lpirfs <- function(data_set, shock_var, contemp_others) {
   lpirfs::lp_lin_panel(
     data_set = data_set,
-    endog_data = "log_income_sa",
+    endog_data = "log_consumption",
     cumul_mult = TRUE,
     shock = shock_var,
     diff_shock = FALSE,
@@ -152,7 +151,7 @@ for (term in shock_terms) {
 }
 
 out_df <- bind_rows(rows)
-out_csv <- file.path(OUT_TBL, "irf_income_directional_dummies_twfe_dk.csv")
+out_csv <- file.path(OUT_TBL, "irf_consumption_directional_dummies_twfe_dk.csv")
 write_csv(out_df, out_csv)
 cat(sprintf("✓ Saved benchmark table: %s\n", out_csv))
 
@@ -174,10 +173,10 @@ p <- ggplot(plot_df, aes(x = horizon, y = estimate_1sd)) +
   facet_wrap(~panel_label, nrow = 2, ncol = 2, scales = "free_y") +
   scale_x_continuous(breaks = seq(0, MAX_HORIZON, by = 6), limits = c(0, MAX_HORIZON)) +
   labs(
-    title = "Income LP IRFs with Directional Dummies (TWFE)",
-    subtitle = "Outcome: log(mean_income_sa); one LP per directional interaction shock; Driscoll-Kraay 90% CI; responses scaled to 1-SD of each shock",
+    title = "Consumption LP IRFs with Directional Dummies (TWFE)",
+    subtitle = "Outcome: log(consumption_index); one LP per directional interaction shock; Driscoll-Kraay 90% CI; responses scaled to 1-SD of each shock",
     x = "Horizon (months)",
-    y = "Cumulative log income response (for 1-SD directional interaction shock)"
+    y = "Cumulative log consumption response (for 1-SD directional interaction shock)"
   ) +
   theme_bw(base_size = 11) +
   theme(
@@ -186,7 +185,7 @@ p <- ggplot(plot_df, aes(x = horizon, y = estimate_1sd)) +
     legend.position = "none"
   )
 
-out_png <- file.path(OUT_PLT, "irf_income_directional_dummies_twfe_dk_4panel.png")
+out_png <- file.path(OUT_PLT, "irf_consumption_directional_dummies_twfe_dk_4panel.png")
 ggsave(out_png, p, width = 11, height = 8.5, dpi = 300)
 cat(sprintf("✓ Saved benchmark plot: %s\n", out_png))
 
@@ -205,7 +204,7 @@ print(check_nobs)
 
 cat("\nNotes:\n")
 cat("  - TWFE only (panel_effect='twoways').\n")
-cat("  - Implemented directional heterogeneity via separate directional shock interactions, not lp_nl_panel.\n")
+cat("  - Directional heterogeneity via separate directional shock interactions, not lp_nl_panel.\n")
 cat("  - Each LP includes the other three directional shocks as contemporaneous controls.\n")
 
-cat("\n=== LPIRFS INCOME HETEROGENEITY COMPLETE ===\n")
+cat("\n=== LPIRFS CONSUMPTION HETEROGENEITY COMPLETE ===\n")
