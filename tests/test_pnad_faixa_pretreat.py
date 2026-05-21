@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pnad_faixa_pretreat import (
+from scripts.data_prep.pnad_faixa_pretreat import (
     _faixa_educ_to_vd3004_one,
     _faixa_idade_to_age_one,
     faixa_educ_to_vd3004,

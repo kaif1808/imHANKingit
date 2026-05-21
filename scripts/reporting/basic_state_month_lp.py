@@ -366,8 +366,14 @@ def build_matched_panel(
     consumption: pd.DataFrame,
     htm: pd.DataFrame,
     labour: pd.DataFrame,
-    shocks: pd.DataFrame,
+    shocks: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if shocks is None:
+        shocks = labour
+        labour = consumption[["uf_code", "year", "month"]].drop_duplicates().copy()
+        for col in LABOUR_COLS:
+            labour[col] = np.nan
+
     summary_rows = [
         _summary_row("consumption_long", consumption),
         _summary_row("htm_shares", htm),

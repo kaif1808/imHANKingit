@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-import htm_classification as htm
+from scripts.reporting import htm_classification as htm
 
 
 POF_QUINTILE_EDGES = np.array([0, 500, 1000, 1500, 2000, 3000], dtype=float)

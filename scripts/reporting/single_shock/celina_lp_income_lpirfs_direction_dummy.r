@@ -3,6 +3,7 @@
 suppressPackageStartupMessages({
   library(tidyverse)
   library(lpirfs)
+  library(mFilter)
 })
 
 set.seed(42)
@@ -44,14 +45,16 @@ panel <- d_raw |>
   arrange(uf_code, year, month_num) |>
   group_by(uf_code) |>
   mutate(
-    log_income_sa = log(mean_income_sa),
-    log_imports = log(coalesce(vl_imports, 0) + 1),
-    log_exports = log(coalesce(vl_exports, 0) + 1),
-    log_bf = log(coalesce(total_value_BF_old, 0) + 1),
-    infl_mom = log(ipca_index) - log(lag(ipca_index, 1)),
-    infl_yoy_raw = log(ipca_index) - log(lag(ipca_index, 12)),
-    infl_yoy = coalesce(infl_yoy_raw, infl_mom * 12),
-    lag1_li = lag(log_income_sa),
+    log_income_sa    = log(mean_income_sa),
+    log_imports      = log(coalesce(vl_imports, 0) + 1),
+    log_exports      = log(coalesce(vl_exports, 0) + 1),
+    log_bf           = log(coalesce(total_value_BF_old, 0) + 1),
+    infl_mom         = log(ipca_index) - log(lag(ipca_index, 1)),
+    infl_yoy_raw     = log(ipca_index) - log(lag(ipca_index, 12)),
+    infl_yoy         = coalesce(infl_yoy_raw, infl_mom * 12),
+    lag1_li          = lag(log_income_sa),
+    hp_cycle_income  = mFilter::hpfilter(log_income_sa, freq = 129600)$cycle,
+    lag1_hp_cycle    = lag(hp_cycle_income),
     mp_shock_pos = pmax(mp_shock, 0),
     mp_shock_neg_abs = abs(pmin(mp_shock, 0)),
     # Directional interaction shocks.
@@ -69,11 +72,11 @@ if (!"log_credit_pf" %in% names(panel)) {
 
 CTRL_BASE <- c(
   "lag1_share_ph2m", "lag1_share_wh2m", "log_imports", "log_exports",
-  "infl_yoy", "log_bf", "log_credit_pf", "lag1_li"
+  "infl_yoy", "log_bf", "log_credit_pf", "lag1_hp_cycle"
 )
 
 shock_terms <- c("mp_pos_x_ph2m", "mp_neg_x_ph2m", "mp_pos_x_wh2m", "mp_neg_x_wh2m")
-required_cols <- c("uf_code", "ym_id", "log_income_sa", shock_terms, CTRL_BASE)
+required_cols <- c("uf_code", "ym_id", "hp_cycle_income", shock_terms, CTRL_BASE)
 missing_cols <- setdiff(required_cols, names(panel))
 if (length(missing_cols) > 0) {
   stop(sprintf("Missing required columns: %s", paste(missing_cols, collapse = ", ")))
@@ -86,7 +89,7 @@ bench_input <- base_panel |>
   select(
     uf_code,
     ym_id,
-    log_income_sa,
+    hp_cycle_income,
     all_of(shock_terms),
     all_of(CTRL_BASE)
   )
@@ -96,7 +99,7 @@ cat(sprintf("✓ Prefiltered sample: %d rows\n", nrow(base_panel)))
 run_lpirfs <- function(data_set, shock_var, contemp_others) {
   lpirfs::lp_lin_panel(
     data_set = data_set,
-    endog_data = "log_income_sa",
+    endog_data = "hp_cycle_income",
     cumul_mult = TRUE,
     shock = shock_var,
     diff_shock = FALSE,
@@ -107,7 +110,7 @@ run_lpirfs <- function(data_set, shock_var, contemp_others) {
     robust_maxlag = 6,
     c_exog_data = contemp_others,
     l_exog_data = CTRL_BASE,
-    lags_exog_data = 1,
+    lags_exog_data = 3,
     confint = CI_MULT,
     hor = LP_HOR
   )
@@ -152,7 +155,7 @@ for (term in shock_terms) {
 }
 
 out_df <- bind_rows(rows)
-out_csv <- file.path(OUT_TBL, "irf_income_directional_dummies_twfe_dk.csv")
+out_csv <- file.path(OUT_TBL, "irf_income_directional_dummies_twfe_dk_hp.csv")
 write_csv(out_df, out_csv)
 cat(sprintf("✓ Saved benchmark table: %s\n", out_csv))
 
@@ -175,9 +178,9 @@ p <- ggplot(plot_df, aes(x = horizon, y = estimate_1sd)) +
   scale_x_continuous(breaks = seq(0, MAX_HORIZON, by = 6), limits = c(0, MAX_HORIZON)) +
   labs(
     title = "Income LP IRFs with Directional Dummies (TWFE)",
-    subtitle = "Outcome: log(mean_income_sa); one LP per directional interaction shock; Driscoll-Kraay 90% CI; responses scaled to 1-SD of each shock",
+    subtitle = "Outcome: HP-cycle log income (λ=129600); one LP per directional interaction shock; Driscoll-Kraay 90% CI; responses scaled to 1-SD of each shock",
     x = "Horizon (months)",
-    y = "Cumulative log income response (for 1-SD directional interaction shock)"
+    y = "Cumulative HP-cycle log income response (for 1-SD directional interaction shock)"
   ) +
   theme_bw(base_size = 11) +
   theme(
@@ -186,7 +189,7 @@ p <- ggplot(plot_df, aes(x = horizon, y = estimate_1sd)) +
     legend.position = "none"
   )
 
-out_png <- file.path(OUT_PLT, "irf_income_directional_dummies_twfe_dk_4panel.png")
+out_png <- file.path(OUT_PLT, "irf_income_directional_dummies_twfe_dk_4panel_hp.png")
 ggsave(out_png, p, width = 11, height = 8.5, dpi = 300)
 cat(sprintf("✓ Saved benchmark plot: %s\n", out_png))
 

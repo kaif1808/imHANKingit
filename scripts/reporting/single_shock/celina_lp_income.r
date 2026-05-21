@@ -125,7 +125,7 @@ get_coef_vc <- function(m, vc, term) {
 # ── ① State panel LP — lag1_tfe ───────────────────────────────────────────────
 
 DIRECTIONS <- c("con", "exp")
-RTYPES     <- c("cumulative", "marginal")
+RTYPES     <- c("cumulative")
 all_results <- list()
 t_start <- proc.time()
 
@@ -149,13 +149,7 @@ for (direction in DIRECTIONS) {
         filter(!is.na(lag1_li), !is.na(mp_shock), !is.na(log_income_sa)) |>
         arrange(uf_code, year, month_num) |>
         group_by(uf_code) |>
-        mutate(y_resp = if (rtype == "cumulative") {
-          lead(log_income_sa, h) - lag1_li
-        } else if (h == 0) {
-          log_income_sa - lag1_li
-        } else {
-          lead(log_income_sa, h) - lead(log_income_sa, h - 1)
-        }) |>
+        mutate(y_resp = lead(log_income_sa, h) - lag1_li) |>
         ungroup() |>
         filter(!is.na(y_resp))
 
@@ -243,13 +237,7 @@ for (direction in DIRECTIONS) {
 
       dn <- nat |>
         filter(!is.na(lag1_li), !is.na(mp_shock)) |>
-        mutate(y_resp = if (rtype == "cumulative") {
-          lead(log_income_sa, h) - lag1_li
-        } else if (h == 0) {
-          log_income_sa - lag1_li
-        } else {
-          lead(log_income_sa, h) - lead(log_income_sa, h - 1)
-        }) |>
+        mutate(y_resp = lead(log_income_sa, h) - lag1_li) |>
         filter(!is.na(y_resp))
 
       fml_n <- as.formula(paste("y_resp ~", shock_var,
@@ -312,7 +300,7 @@ for (direction in DIRECTIONS) {
   slabel <- if (direction == "con") "Contractionary (Rate Hikes)" else "Expansionary (Rate Cuts)"
 
   for (rtype in RTYPES) {
-    ytitle <- if (rtype == "cumulative") "Cumulative log income response" else "Marginal log income response"
+    ytitle <- "Cumulative log income response"
 
     plot_df <- all_results[[paste(direction, rtype, "lag1_tfe", sep = "_")]] |>
       pivot_longer(

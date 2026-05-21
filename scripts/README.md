@@ -13,6 +13,7 @@ This directory contains non-core scripts organized by purpose.
 - `scripts/data_prep/` — data preparation helpers.
   - `pnad.r` — PNADC panel pre-filter helper.
   - `install.R` — helper for R-side dependency setup.
+  - `export_br_bcb_estban_municipio_parquet.R` — basedosdados BigQuery export to a single Parquet file.
 - `scripts/reporting/` — report-generation scripts.
   - `irf_heterogeneity_final.R` — canonical IRF reporting script.
 - `scripts/utils/` — utility scripts used occasionally.
