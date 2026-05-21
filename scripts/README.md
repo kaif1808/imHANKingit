@@ -6,7 +6,7 @@ This directory contains non-core scripts organized by purpose.
 
 - `htm_classification.py` — main POF -> streamed monthly PNADC classification pipeline.
 - `generate_choropleths.py` — standalone choropleth generation from state-quarter shares.
-- `cumulative_irf_heterogeneity.py` — state-level monthly IRF heterogeneity workflow.
+- `cumulative_irf_heterogeneity.py` — deprecated shim; archived implementation moved to `archive/legacy/reporting/cumulative_irf_heterogeneity.py`.
 
 ## Folder Structure
 
@@ -14,7 +14,8 @@ This directory contains non-core scripts organized by purpose.
   - `pnad.r` — PNADC panel pre-filter helper.
   - `install.R` — helper for R-side dependency setup.
 - `scripts/reporting/` — report-generation scripts.
-  - `irf_heterogeneity_final.R` — canonical IRF reporting script.
+  - See `scripts/reporting/README.md` for the ordered active workflow.
+  - `irf_heterogeneity_final.R` — deprecated shim; archived implementation moved to `archive/legacy/reporting/irf_heterogeneity_final.R`.
 - `scripts/utils/` — utility scripts used occasionally.
   - `convert_report_to_notebook.py`
   - `fix_notebook_markdown.py`
@@ -32,7 +33,7 @@ This directory contains non-core scripts organized by purpose.
 
 1. Optional prep: produce or update `pnadc_matched_with_periods.parquet`
 2. Classify: `python3 htm_classification.py`
-3. Heterogeneity IRFs: `python3 cumulative_irf_heterogeneity.py`
+3. Monthly LP dataset/IRFs: follow `scripts/reporting/README.md`
 4. Choropleths (standalone rerun): `python3 generate_choropleths.py`
 
 ## Hygiene Guardrails For New Scripts

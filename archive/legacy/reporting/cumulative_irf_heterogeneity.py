@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""DEPRECATED stub.
-Archived implementation: archive/legacy/reporting/cumulative_irf_heterogeneity.py
+"""DEPRECATED: archived at archive/legacy/reporting/cumulative_irf_heterogeneity.py.
+
+Use scripts/reporting/basic_state_month_lp.py and the celina_lp*_lpirfs* scripts instead.
 """
 
 raise SystemExit(
