@@ -1,0 +1,48 @@
+{
+  "generated_at_utc": "2026-05-23T10:39:14.246525+00:00",
+  "purpose": "Provenance for DI-shock TWFE empirical IRF targets used by THRANK comparison/tuning",
+  "entries": [
+    {
+      "path": "scripts/reporting/celina_lp_lpirfs_direction_dummy.r",
+      "exists": true,
+      "size_bytes": 7237,
+      "mtime_utc": "2026-05-21T21:45:44.520104+00:00",
+      "sha256": "15034395a33bf205a695ce1f98e16635136e40f39ea636c796c5f1062c59c9d0"
+    },
+    {
+      "path": "scripts/reporting/celina_lp_income_lpirfs_direction_dummy.r",
+      "exists": true,
+      "size_bytes": 7237,
+      "mtime_utc": "2026-05-21T21:45:44.519907+00:00",
+      "sha256": "59721e69092b3958bc579e6fd56a33c567dcf5dc345475fe80a79046390e4b0b"
+    },
+    {
+      "path": "scripts/reporting/celina_lp_wealth_lpirfs_direction_dummy.r",
+      "exists": true,
+      "size_bytes": 7227,
+      "mtime_utc": "2026-05-21T22:18:48.861270+00:00",
+      "sha256": "210a0ddbc75d9ef1adc3550fc384e05e3f7ed8e53f6f02341e6664a9e56bf851"
+    },
+    {
+      "path": "results/tables/lp_controls/irf_consumption_directional_dummies_twfe_dk.csv",
+      "exists": true,
+      "size_bytes": 46086,
+      "mtime_utc": "2026-05-23T10:32:05.660100+00:00",
+      "sha256": "584ab3fcf292395fbeab682b21566ffe98a3d38413e4bedf56e83c50714796b1"
+    },
+    {
+      "path": "results/tables/lp_income/irf_income_directional_dummies_twfe_dk.csv",
+      "exists": true,
+      "size_bytes": 45805,
+      "mtime_utc": "2026-05-23T10:33:35.852502+00:00",
+      "sha256": "1e99e1fb6b2a0244cca8b1e507e64244045d1783eb9a617efcbae051ed116f67"
+    },
+    {
+      "path": "results/tables/lp_wealth/irf_wealth_directional_dummies_twfe_dk.csv",
+      "exists": true,
+      "size_bytes": 45045,
+      "mtime_utc": "2026-05-23T10:33:34.896526+00:00",
+      "sha256": "d38a934f20e10bb5756c86dde1fe771aa91b109c6c60b07c414baa65f10bbae8"
+    }
+  ]
+}

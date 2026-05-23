@@ -1,0 +1,13 @@
+dataset,term,direction,lp_h_min,lp_h_max,lp_n_h,model_h_min,model_h_max,model_n_h,overlap_h_min,overlap_h_max,overlap_n_h,lp_horizons_missing_in_model,model_horizons_missing_in_lp
+lp_controls,mp_pos_x_ph2m,contractionary,0,48,49,0,48,49,0,48,49,,
+lp_controls,mp_neg_x_ph2m,expansionary,0,48,49,0,48,49,0,48,49,,
+lp_controls,mp_pos_x_wh2m,contractionary,0,48,49,0,48,49,0,48,49,,
+lp_controls,mp_neg_x_wh2m,expansionary,0,48,49,0,48,49,0,48,49,,
+lp_income,mp_pos_x_ph2m,contractionary,0,48,49,0,48,49,0,48,49,,
+lp_income,mp_neg_x_ph2m,expansionary,0,48,49,0,48,49,0,48,49,,
+lp_income,mp_pos_x_wh2m,contractionary,0,48,49,0,48,49,0,48,49,,
+lp_income,mp_neg_x_wh2m,expansionary,0,48,49,0,48,49,0,48,49,,
+lp_wealth,mp_pos_x_ph2m,contractionary,0,48,49,0,48,49,0,48,49,,
+lp_wealth,mp_neg_x_ph2m,expansionary,0,48,49,0,48,49,0,48,49,,
+lp_wealth,mp_pos_x_wh2m,contractionary,0,48,49,0,48,49,0,48,49,,
+lp_wealth,mp_neg_x_wh2m,expansionary,0,48,49,0,48,49,0,48,49,,
