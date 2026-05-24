@@ -26,7 +26,8 @@ d_raw <- read_csv(lp_path, show_col_types = FALSE) |>
   rename(
     month_num = month,
     lag1_share_ph2m = lag1_share_PH2M,
-    lag1_share_wh2m = lag1_share_WH2M
+    lag1_share_wh2m = lag1_share_WH2M,
+    lag1_share_ricardian = lag1_share_Ricardian
   )
 
 if (!"mp_shock" %in% names(d_raw)) {
@@ -58,6 +59,8 @@ panel <- d_raw |>
     mp_neg_x_ph2m = mp_shock_neg_abs * lag1_share_ph2m,
     mp_pos_x_wh2m = mp_shock_pos * lag1_share_wh2m,
     mp_neg_x_wh2m = mp_shock_neg_abs * lag1_share_wh2m,
+    mp_pos_x_ricardian = mp_shock_pos * lag1_share_ricardian,
+    mp_neg_x_ricardian = mp_shock_neg_abs * lag1_share_ricardian,
     ym_id = year * 100L + month_num
   ) |>
   ungroup()
@@ -71,7 +74,11 @@ CTRL_BASE <- c(
   "infl_yoy", "log_bf", "log_credit_pf", "lag1_lc"
 )
 
-shock_terms <- c("mp_pos_x_ph2m", "mp_neg_x_ph2m", "mp_pos_x_wh2m", "mp_neg_x_wh2m")
+shock_terms <- c(
+  "mp_pos_x_ph2m", "mp_neg_x_ph2m",
+  "mp_pos_x_wh2m", "mp_neg_x_wh2m",
+  "mp_pos_x_ricardian", "mp_neg_x_ricardian"
+)
 required_cols <- c("uf_code", "ym_id", "log_consumption", shock_terms, CTRL_BASE)
 missing_cols <- setdiff(required_cols, names(panel))
 if (length(missing_cols) > 0) {
@@ -159,18 +166,25 @@ plot_df <- out_df |>
   mutate(
     panel_label = recode(
       term,
-      mp_pos_x_ph2m = "PH2M x Contractionary shock",
-      mp_neg_x_ph2m = "PH2M x Expansionary shock",
-      mp_pos_x_wh2m = "WH2M x Contractionary shock",
-      mp_neg_x_wh2m = "WH2M x Expansionary shock"
-    )
+      mp_pos_x_ph2m       = "PH2M x Contractionary shock",
+      mp_neg_x_ph2m       = "PH2M x Expansionary shock",
+      mp_pos_x_wh2m       = "WH2M x Contractionary shock",
+      mp_neg_x_wh2m       = "WH2M x Expansionary shock",
+      mp_pos_x_ricardian  = "Ricardian x Contractionary shock",
+      mp_neg_x_ricardian  = "Ricardian x Expansionary shock"
+    ),
+    panel_label = factor(panel_label, levels = c(
+      "PH2M x Contractionary shock", "PH2M x Expansionary shock",
+      "WH2M x Contractionary shock", "WH2M x Expansionary shock",
+      "Ricardian x Contractionary shock", "Ricardian x Expansionary shock"
+    ))
   )
 
 p <- ggplot(plot_df, aes(x = horizon, y = estimate_1sd)) +
   geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
   geom_ribbon(aes(ymin = ci_low_1sd, ymax = ci_high_1sd), alpha = 0.16, color = NA, fill = "#1f77b4") +
   geom_line(linewidth = 0.9, color = "#1f77b4") +
-  facet_wrap(~panel_label, nrow = 2, ncol = 2, scales = "free_y") +
+  facet_wrap(~panel_label, nrow = 3, ncol = 2, scales = "free_y") +
   scale_x_continuous(breaks = seq(0, MAX_HORIZON, by = 6), limits = c(0, MAX_HORIZON)) +
   labs(
     title = "Consumption LP IRFs with Directional Dummies (TWFE)",
@@ -185,8 +199,8 @@ p <- ggplot(plot_df, aes(x = horizon, y = estimate_1sd)) +
     legend.position = "none"
   )
 
-out_png <- file.path(OUT_PLT, "irf_consumption_directional_dummies_twfe_dk_4panel.png")
-ggsave(out_png, p, width = 11, height = 8.5, dpi = 300)
+out_png <- file.path(OUT_PLT, "irf_consumption_directional_dummies_twfe_dk_6panel.png")
+ggsave(out_png, p, width = 11, height = 12, dpi = 300)
 cat(sprintf("✓ Saved benchmark plot: %s\n", out_png))
 
 check_h <- identical(sort(unique(out_df$horizon)), 0:MAX_HORIZON)
@@ -198,7 +212,7 @@ check_nobs <- out_df |>
 
 cat("\nVerification:\n")
 cat(sprintf("  - horizons exactly 0:%d: %s\n", MAX_HORIZON, ifelse(check_h, "OK", "FAIL")))
-cat(sprintf("  - full coefficient paths present (4 directional terms): %s\n", ifelse(check_terms, "OK", "FAIL")))
+cat(sprintf("  - full coefficient paths present (6 directional terms): %s\n", ifelse(check_terms, "OK", "FAIL")))
 cat("  - nobs weakly non-increasing by series:\n")
 print(check_nobs)
 
