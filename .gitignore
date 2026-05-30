@@ -98,3 +98,5 @@ results/tables/pof_group_wealth_income_summary_classical.csv
 results/tables/pof_group_wealth_income_summary_poverty_split.csv
 results/tables/pof_group_wealth_income_summary.csv
 wealth/
+.agents/
+.claude/
