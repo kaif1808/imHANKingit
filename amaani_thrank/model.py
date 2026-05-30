@@ -372,8 +372,8 @@ if __name__ == '__main__':
                 ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig(f'irfs_case{case}.pdf', dpi=150, bbox_inches='tight')
-        print(f"IRFs saved to irfs_case{case}.pdf")
+        plt.savefig(f'irfs_case{case}.png', dpi=150, bbox_inches='tight')
+        print(f"IRFs saved to irfs_case{case}.png")
         plt.close()
 
         # Print relative IRFs (key empirical targets)
